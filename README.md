@@ -48,16 +48,24 @@ Install jq if you don't have it: `sudo apt install jq` / `sudo dnf install jq` /
 
 ## Install
 
+One line (installs to `/usr/local/bin` or `~/.local/bin`):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/thijsvos/hfget/main/install.sh | sh
+```
+
+Or clone / copy the single file:
+
 ```sh
 git clone https://github.com/thijsvos/hfget.git
-cd hfget
-chmod +x hfget
-# put it on your PATH, e.g.:
+cd hfget && chmod +x hfget
 ln -s "$PWD/hfget" /usr/local/bin/hfget      # or ~/.local/bin/hfget
 ```
 
-Or just download the single `hfget` file, `chmod +x hfget`, and move it onto
-your `PATH`. There's nothing else to install.
+There's nothing else to install — it's one bash script.
+
+**Supported:** macOS and Linux, `bash` 3.2+, with `curl` and `jq`. (Windows
+only via WSL. Not on Homebrew — install with the one-liner above.)
 
 Set a default download directory once (optional):
 
@@ -139,6 +147,10 @@ shows up in `ps`.
 | `HFGET_STATE_DIR` | queue state dir (default: `$XDG_STATE_HOME/hfget` or `~/.hfget`) |
 | `HFGET_WARN_GB` | size (GB) above which confirmation defaults to No (default 100) |
 | `HFGET_YES` | skip confirmation prompts (same as `-y`) |
+| `HFGET_MIN_SPEED` | reconnect if a transfer stalls below this many bytes/sec (default 1 MB/s; `0` disables) |
+| `HFGET_SPEED_TIME` | seconds a stall must persist before reconnecting (default 30) |
+| `HFGET_QUEUE_NOSTART` | `add` never auto-starts the background runner |
+| `HFGET_QUEUE_NOWAIT` | the runner doesn't wait for a manual download in progress |
 | `HFGET_NOCAFFEINE` | don't keep the machine awake (macOS) |
 
 ## Troubleshooting

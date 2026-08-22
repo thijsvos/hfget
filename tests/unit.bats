@@ -61,6 +61,23 @@ setup() {
   [ "${#ENTRY_ARGS[@]}" -eq 0 ]
 }
 
+@test "assert_safe_paths rejects traversal and absolute paths, allows normal ones" {
+  bad="$(mktemp)"
+  printf '10\t-\t../../etc/passwd\n' > "$bad"
+  run bash -c "source '$HFGET'; MODEL=x/y; assert_safe_paths '$bad'"
+  [ "$status" -ne 0 ]
+  printf '10\t-\t/etc/passwd\n' > "$bad"
+  run bash -c "source '$HFGET'; MODEL=x/y; assert_safe_paths '$bad'"
+  [ "$status" -ne 0 ]
+  printf '10\t-\ta/b/..\n' > "$bad"
+  run bash -c "source '$HFGET'; MODEL=x/y; assert_safe_paths '$bad'"
+  [ "$status" -ne 0 ]
+  printf '10\t-\tsubdir/model file.safetensors\n' > "$bad"
+  run bash -c "source '$HFGET'; MODEL=x/y; assert_safe_paths '$bad'"
+  [ "$status" -eq 0 ]
+  rm -f "$bad"
+}
+
 @test "sha256 computes the correct digest" {
   tmp="$(mktemp)"
   printf 'hello' > "$tmp"

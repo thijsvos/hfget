@@ -17,7 +17,7 @@
 if [[ "${BASH_SOURCE[0]}" != "${0}" ]]; then HFGET_SOURCED=1; else HFGET_SOURCED=0; fi
 [[ $HFGET_SOURCED -eq 1 ]] || set -euo pipefail
 
-VERSION="2.5.0"
+VERSION="2.6.0"
 HF="https://huggingface.co"
 # State dir: explicit override > XDG state home > ~/.hfget
 if [[ -n ${HFGET_STATE_DIR:-} ]]; then QDIR=$HFGET_STATE_DIR
@@ -36,6 +36,8 @@ SPEED_TIME=${HFGET_SPEED_TIME:-30}      # sustained seconds before aborting
 case "$MIN_SPEED"  in ''|*[!0-9]*) MIN_SPEED=1048576 ;; esac
 case "$SPEED_TIME" in ''|*[!0-9]*) SPEED_TIME=30 ;; esac
 [[ $MIN_SPEED -ge 1 ]] || MIN_SPEED=1   # 0 → effectively disabled
+WARN_GB=${HFGET_WARN_GB:-100}           # confirm defaults to No above this size (GB)
+case "$WARN_GB" in ''|*[!0-9]*) WARN_GB=100 ;; esac
 
 # Keep the machine awake for the duration of the run (model pulls can take
 # hours). macOS: caffeinate. Cleanly skipped where caffeinate is absent (Linux).
@@ -193,11 +195,16 @@ normalize_model_id() {
 }
 
 # Ask a yes/no question on the controlling terminal; $2 is the default (y/n).
-# Non-interactive contexts (stderr not a tty — e.g. the queue runner's
-# download children) and -y/--yes proceed automatically.
+# -y/--yes always proceeds. With no controlling terminal, proceed on a safe
+# default ("[Y/n]") but REFUSE a "default No" (oversize / multi-quant), so a
+# piped or cron run can't silently pull something huge. Queue-runner children
+# are non-tty but run with HFGET_YES=1 (already confirmed at 'add' time).
 confirm() {
   local prompt=$1 def=${2:-y} ans
-  if [[ -n ${YES:-} || ! -t 2 || ! -r /dev/tty ]]; then return 0; fi
+  if [[ -n ${YES:-} ]]; then return 0; fi
+  if [[ ! -t 2 || ! -r /dev/tty ]]; then
+    if [[ $def == y ]]; then return 0; else return 1; fi
+  fi
   if [[ $def == y ]]; then prompt="$prompt [Y/n] "; else prompt="$prompt [y/N] "; fi
   printf '%s' "$prompt" >&2
   IFS= read -r ans </dev/tty || return 1
@@ -237,7 +244,8 @@ api_get() {
               --connect-timeout 15 --retry 2 "$url" </dev/null) \
     || die "network error contacting huggingface.co (curl exit $?)"
   if [[ $code != 200 ]]; then
-    msg=$(jq -r '.error // empty' "$TMPD/body" 2>/dev/null | head -n 1) || msg=''
+    # Strip control chars — the API error string is untrusted and printed to the TTY.
+    msg=$(jq -r '.error // empty' "$TMPD/body" 2>/dev/null | head -n 1 | LC_ALL=C tr -d '\000-\037\177') || msg=''
   fi
   case "$code" in
     200) ;;
@@ -249,6 +257,9 @@ api_get() {
   NEXT_URL=$(tr -d '\r' < "$TMPD/rhdr" | grep -i '^link:' \
              | sed -n 's/.*<\([^>]*\)>[[:space:]]*;[[:space:]]*rel="next".*/\1/p' \
              | head -n 1) || NEXT_URL=''
+  # Only follow pagination on the same HTTPS host — never hand the bearer token
+  # to a server-chosen URL.
+  case "$NEXT_URL" in "$HF/"*) ;; *) NEXT_URL='' ;; esac
 }
 
 # Fetch the recursive file tree of $MODEL @ $REV into $TMPD/files.tsv
@@ -256,14 +267,17 @@ api_get() {
 fetch_tree() {
   REV_ENC=$(jq -rn --arg r "$REV" '$r | @uri')
   FILES_TSV="$TMPD/files.tsv"; : > "$FILES_TSV"
-  local url="$HF/api/models/$MODEL/tree/$REV_ENC?recursive=true"
+  local url="$HF/api/models/$MODEL/tree/$REV_ENC?recursive=true" pages=0
   while [[ -n $url ]]; do
     api_get "$url"
-    jq -r '.[] | select(.type == "file") | [(.size // 0), (.lfs.oid // "-"), .path] | @tsv' \
+    jq -r '.[] | select(.type == "file") | [(.size | numbers // 0), (.lfs.oid // "-"), .path] | @tsv' \
       "$TMPD/body" >> "$FILES_TSV"
     url=$NEXT_URL
+    pages=$((pages + 1))
+    [[ $pages -lt 10000 ]] || die "too many pages listing $MODEL — aborting"
   done
   [[ -s $FILES_TSV ]] || die "no files found in $MODEL at revision '$REV'"
+  assert_safe_paths "$FILES_TSV"   # single choke point: reject unsafe paths at the source
 }
 
 # Apply INCLUDES/EXCLUDES globs to FILES_TSV → SEL_TSV (callers check -s).
@@ -275,6 +289,23 @@ apply_filters() {
     if [[ ${#EXCLUDES[@]} -gt 0 ]] && matches_any "$path" "${EXCLUDES[@]}"; then continue; fi
     printf '%s\t%s\t%s\n' "$size" "$lfs" "$path" >> "$SEL_TSV"
   done < "$FILES_TSV"
+}
+
+# Path-traversal guard: repo file paths come from the API and are untrusted.
+# A valid one is relative with no ".." component. Abort on anything that could
+# write outside the destination (absolute path, or a ".." segment). $1 = a TSV
+# whose 3rd column is the path.
+assert_safe_paths() {
+  local size lfs path
+  while IFS=$'\t' read -r size lfs path; do
+    case "$path" in
+      /* | '') die "refusing '$MODEL': unsafe file path from repo: '$path'" ;;
+      *[[:cntrl:]]*) die "refusing '$MODEL': file path from repo contains control characters" ;;
+    esac
+    case "/$path/" in
+      */../*) die "refusing '$MODEL': unsafe file path (contains '..') from repo: '$path'" ;;
+    esac
+  done < "$1"
 }
 
 # HEAD the first selected file; sets PROBE_CODE (gated repos answer 401/403).
@@ -316,7 +347,7 @@ overview_tsv() {
 # Above HFGET_WARN_GB (default 100 GB), or on GGUF quant spam, default is No.
 size_guard() {
   local bytes=$1 verb=$2 warn_bytes
-  warn_bytes=$(( ${HFGET_WARN_GB:-100} * 1000000000 ))
+  warn_bytes=$(( WARN_GB * 1000000000 ))
   if [[ $bytes -ge $warn_bytes || ${OV_NGGUF:-0} -ge 3 ]]; then
     confirm "$verb $(human "$bytes") anyway?" n
   else
@@ -369,6 +400,7 @@ normalize_model_id "$MODEL"
 MODEL=$NORM_MODEL
 if [[ -n $NORM_UREV && $REV == main ]]; then REV=$NORM_UREV; fi
 [[ $MODEL =~ $MODEL_ID_RE ]] || die "'$MODEL' does not look like a HuggingFace model id (expected: org/model)"
+case "/$MODEL/" in */../*) die "invalid model id '$MODEL' (contains '..')" ;; esac
 
 # ------------------------------------------------------------ token & temp --
 resolve_token
@@ -545,17 +577,22 @@ fetch_one() {
     info "[$idx/$n_work] resuming $path at $(human "$start_have") of $(human "$size")"
   fi
 
+  # Cap the transfer at the declared size (+1 MB slack) so a bogus oversized or
+  # length-less response can't fill the disk. Skipped for zero-length files.
+  local maxfs=()
+  if [[ $size -gt 0 ]]; then maxfs=(--max-filesize "$((size + 1048576))"); fi
+
   stall=0
   while :; do
     rc=0 code=200
     pre=$(filesize "$part")
     if [[ $pre -lt $size ]]; then
       if [[ $QUIET -eq 1 ]]; then
-        code=$(curl -fsSL -H @"$HDRS" --connect-timeout 15 --retry 2 --retry-delay 2 \
+        code=$(curl -fsSL -H @"$HDRS" ${maxfs[@]+"${maxfs[@]}"} --connect-timeout 15 --retry 2 --retry-delay 2 \
                     --speed-limit "$MIN_SPEED" --speed-time "$SPEED_TIME" \
                     -C - -o "$part" -w '%{http_code}' "$url" </dev/null) || rc=$?
       else
-        code=$(curl -fSL --progress-bar -H @"$HDRS" --connect-timeout 15 --retry 2 --retry-delay 2 \
+        code=$(curl -fSL --progress-bar -H @"$HDRS" ${maxfs[@]+"${maxfs[@]}"} --connect-timeout 15 --retry 2 --retry-delay 2 \
                     --speed-limit "$MIN_SPEED" --speed-time "$SPEED_TIME" \
                     -C - -o "$part" -w '%{http_code}' "$url" </dev/null) || rc=$?
       fi
@@ -605,7 +642,11 @@ fetch_one() {
     fi
   fi
 
-  mv -f "$part" "$out"
+  if ! mv -f "$part" "$out"; then
+    warn "[$idx/$n_work] FAILED: $path (could not move into place at $DEST — check permissions/space)"
+    printf 'FAIL\t0\t%s\n' "$path" >> "$RESULTS"
+    return 1
+  fi
   printf 'OK\t%s\t%s\n' "$((size - start_have))" "$path" >> "$RESULTS"
   if [[ -n ${PROGF:-} ]]; then printf 'F\t%s\n' "$((size - start_have))" >> "$PROGF"; fi
   if [[ $QUIET -eq 1 ]]; then
@@ -677,6 +718,7 @@ LOCKD="$QDIR/lock"
 
 q_init() {
   mkdir -p "$QDIR/logs"
+  chmod 700 "$QDIR" 2>/dev/null || true   # keep queue state + logs private to this user
   local f
   for f in "$QF" "$CF" "$FF" "$DL" "$RL"; do
     if [[ ! -f $f ]]; then : > "$f"; fi
@@ -721,18 +763,19 @@ parse_entry() {
   done
 }
 
-# Pids of hfget download processes that are NOT this process, its child, or a
-# queue subcommand. Catches manual runs (v1 style and 'hfget download').
+# Pids of *foreground* hfget downloads that are NOT this process or its child.
+# Matches the specific "<script> download" invocation, so merely viewing state
+# files (tail/less on ~/.hfget/*, an editor on the script) is not mistaken for a
+# running download and can't stall the runner.
 foreign_hfget_pids() {
   local name
   name=$(basename "$SELF")
   ps -axww -o pid,ppid,command | awk -v me="$$" -v child="${RUN_CHILD:-0}" -v name="$name" '
-    index($0, name) == 0 { next }
+    index($0, name " download") == 0 { next }
     /awk|grep/ { next }
     { pid = $1; ppid = $2 }
     pid == me || ppid == me { next }
     (child != 0) && (pid == child || ppid == child) { next }
-    / (add|queue|status|rm|clear|retry|stop|run|log|help)( |$)/ { next }
     { print pid }
   ' | tr '\n' ' ' | sed 's/ *$//'
 }
@@ -792,10 +835,25 @@ cmd_add() {
     i=$((i + 1))
   done
 
+  # Args PERSISTED in the queue: strip -t/--token and its value so a credential
+  # is never written to the state file. The runner re-resolves the token from
+  # $HF_TOKEN / the token file at download time.
+  local qargs=() skip_next=0 had_token=0
+  for a in ${shared[@]+"${shared[@]}"}; do
+    if [[ $skip_next -eq 1 ]]; then skip_next=0; had_token=1; continue; fi
+    case "$a" in
+      -t|--token) skip_next=1; continue ;;
+    esac
+    qargs+=("$a")
+  done
+  if [[ $had_token -eq 1 ]]; then
+    warn "the -t token is not stored in the queue (kept out of the state file) — set \$HF_TOKEN or ~/.cache/huggingface/token so the runner can authenticate gated models"
+  fi
+
   # Resolve the destination NOW and bake it into every entry, so a queued
   # download can never fail later because the runner lacks HF_NAS_DIR.
   local base='' base_from_env=0
-  for a in ${shared[@]+"${shared[@]}"}; do
+  for a in ${qargs[@]+"${qargs[@]}"}; do
     case "$a" in /*) base=$a; break ;; esac
   done
   if [[ -z $base ]]; then
@@ -803,8 +861,9 @@ cmd_add() {
     base_from_env=1
   fi
   [[ -n $base ]] || die "no destination: pass a base dir (e.g. hfget add <model> \"\$HOME/models\") or set HFGET_DEST — refusing to queue entries that would fail at download time"
+  case "$base" in *$'\t'* | *$'\n'*) die "destination path may not contain tabs or newlines: '$base'" ;; esac
   if [[ $base_from_env -eq 1 ]]; then
-    shared+=("$base")
+    qargs+=("$base")
   fi
   local fsp=$base
   while [[ ! -d $fsp && $fsp != / && $fsp != . ]]; do fsp=$(dirname "$fsp"); done
@@ -853,7 +912,7 @@ cmd_add() {
     if [[ -n ${mrevs[$i]} ]]; then
       line=$(printf '%s\t%s\t%s' "$line" "-r" "${mrevs[$i]}")
     fi
-    for a in ${shared[@]+"${shared[@]}"}; do
+    for a in ${qargs[@]+"${qargs[@]}"}; do
       line=$(printf '%s\t%s' "$line" "$a")
     done
     q_lock
@@ -1029,7 +1088,9 @@ cmd_run() {
       progress_reporter "$pr_base/$model" &
       RUN_REPORTER=$!
     fi
-    HFGET_PROG="$CPF" "$SELF" download "$model" ${ENTRY_ARGS[@]+"${ENTRY_ARGS[@]}"} </dev/null >> "$logf" 2>&1 &
+    # HFGET_YES=1: this entry was already confirmed at 'add' time; the child is
+    # non-tty and must not re-prompt or refuse an approved oversize download.
+    HFGET_YES=1 HFGET_PROG="$CPF" "$SELF" download "$model" ${ENTRY_ARGS[@]+"${ENTRY_ARGS[@]}"} </dev/null >> "$logf" 2>&1 &
     RUN_CHILD=$!
     wait "$RUN_CHILD" || rc=$?
     RUN_CHILD=0

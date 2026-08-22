@@ -4,6 +4,48 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and the project uses the
 `VERSION` string in the `hfget` script as the source of truth.
 
+## [2.6.0] — 2026-08-23
+
+Security hardening pass ahead of a public release (independent audit + fixes).
+
+### Security
+- **Path-traversal guard** at the single choke point (`fetch_tree`): repo file
+  paths from the API are validated before any use — an absolute path, a `..`
+  component, an empty path, or one containing control characters is refused, so
+  a malicious/compromised repo can't write outside the chosen destination.
+- **Token never persisted in the queue.** `hfget add -t <token>` no longer
+  writes the token into `~/.hfget/queue.tsv` (previously world-readable-ish);
+  the runner re-resolves it from `$HF_TOKEN`/the token file at download time.
+  The queue state dir is now created `chmod 700`.
+- **Terminal-escape sanitisation** of untrusted API error strings before they
+  are printed (prevents output/prompt spoofing); control chars in file paths
+  are rejected outright.
+- **Pagination `Link: next` is restricted to the same HTTPS host**, so the
+  bearer token can never be sent to a server-chosen URL. Page count is capped.
+- **`--max-filesize`** on downloads caps a bogus oversized/length-less response
+  so it can't fill the disk.
+- API-declared sizes are coerced to numbers (`jq numbers`); `HFGET_WARN_GB` is
+  validated; model ids containing `..` are rejected.
+
+### Changed
+- **Non-interactive safety:** with no TTY and without `-y`/`HFGET_YES`, a
+  "default No" prompt (oversize / multi-quant) now **aborts** instead of
+  silently proceeding. Queue-runner children run pre-approved (confirmed at
+  `add` time), so the queue is unaffected.
+- A failed final `mv` into place is now reported as a failure instead of a
+  false success.
+- The runner's "wait for a manual download" check matches the specific
+  `hfget download` invocation, so viewing state files (`tail`/`less`/an editor)
+  no longer stalls the queue.
+- CI: `actions/checkout` → v5 (silences the Node 20 deprecation notice).
+
+### Added
+- `install.sh` — one-line installer (`curl … | sh`), honoring `DESTDIR`.
+- Unit test for the path-traversal guard.
+- Docs: one-line install, supported-platforms note, and the previously
+  undocumented env vars (`HFGET_MIN_SPEED`, `HFGET_SPEED_TIME`,
+  `HFGET_QUEUE_NOSTART`, `HFGET_QUEUE_NOWAIT`).
+
 ## [2.5.0] — 2026-08-23
 
 ### Added
