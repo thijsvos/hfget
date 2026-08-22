@@ -1,0 +1,13 @@
+# hfget runtime state (queue, logs, locks) — never commit
+.hfget/
+
+# partial downloads
+*.part
+
+# local scratch / test output
+/scratch/
+/tmp/
+
+# OS cruft
+.DS_Store
+Thumbs.db

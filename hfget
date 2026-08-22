@@ -1,0 +1,1299 @@
+#!/usr/bin/env bash
+#
+# hfget — download HuggingFace model repos to any directory (local disk or a
+#         mounted NAS share), with a built-in download queue.
+#
+# Files are fetched with curl directly into the destination (no local cache),
+# with resume support, retries, glob filters and optional sha256 verification.
+# The queue lets you enqueue N models; a background runner drains them one by
+# one (watch progress with 'hfget queue').
+#
+# Runs on macOS and Linux. Requires: bash 3.2+, curl, jq, and standard
+# coreutils (awk sed grep stat df ...). 'sha256sum' or 'shasum' is needed only
+# for --verify; 'caffeinate' (macOS) is used opportunistically to prevent sleep.
+
+# Detect sourcing (e.g. by the test suite) BEFORE enabling strict mode or any
+# side effects, so tests can source the file and call functions in isolation.
+if [[ "${BASH_SOURCE[0]}" != "${0}" ]]; then HFGET_SOURCED=1; else HFGET_SOURCED=0; fi
+[[ $HFGET_SOURCED -eq 1 ]] || set -euo pipefail
+
+VERSION="2.4.0"
+HF="https://huggingface.co"
+# State dir: explicit override > XDG state home > ~/.hfget
+if [[ -n ${HFGET_STATE_DIR:-} ]]; then QDIR=$HFGET_STATE_DIR
+elif [[ -n ${XDG_STATE_HOME:-} ]]; then QDIR="$XDG_STATE_HOME/hfget"
+else QDIR="$HOME/.hfget"; fi
+SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+YES=${HFGET_YES:-}   # -y/--yes or HFGET_YES=1 skips all confirmation prompts
+
+# Keep the machine awake for the duration of the run (model pulls can take
+# hours). macOS: caffeinate. Cleanly skipped where caffeinate is absent (Linux).
+if [[ $HFGET_SOURCED -eq 0 && -z ${HFGET_CAFFEINATED:-} && -z ${HFGET_NOCAFFEINE:-} ]] && command -v caffeinate >/dev/null 2>&1; then
+  HFGET_CAFFEINATED=1 exec caffeinate -im "$0" "$@"
+fi
+
+if [[ -t 2 ]]; then
+  C_RED=$'\033[31m' C_GRN=$'\033[32m' C_YLW=$'\033[33m' C_DIM=$'\033[2m' C_OFF=$'\033[0m'
+else
+  C_RED='' C_GRN='' C_YLW='' C_DIM='' C_OFF=''
+fi
+info() { printf '%s\n' "$*" >&2; }
+warn() { printf '%swarning:%s %s\n' "$C_YLW" "$C_OFF" "$*" >&2; }
+die()  { printf '%serror:%s %s\n' "$C_RED" "$C_OFF" "$*" >&2; exit 1; }
+
+usage() {
+  cat <<'EOF'
+hfget — download HuggingFace models to any directory, with a built-in queue
+
+Download now (foreground):
+  hfget download <org/model> [base-dir] [options]
+
+  The model repo is mirrored to <base-dir>/<org>/<model>/. The base dir can
+  also be set once via the HFGET_DEST (or HF_NAS_DIR) environment variable.
+
+  -r, --revision REV   branch / tag / commit to download (default: main)
+  -i, --include GLOB   only download files matching GLOB (repeatable)
+  -x, --exclude GLOB   skip files matching GLOB (repeatable, after includes)
+  -l, --list           list the repo's files and sizes, then exit
+  -n, --dry-run        show what would be downloaded, then exit
+  -t, --token TOKEN    HF access token for gated/private models
+                       (default: $HF_TOKEN, else the hf CLI token file)
+  -j, --jobs N         download N files in parallel (default: 1)
+      --verify         sha256-check downloaded LFS files against the HF hash
+      --require-mount  refuse unless the destination is a network mount
+                       (opt-in NAS safety; any dir is allowed by default)
+      --force-local    accepted for compatibility; now a no-op (local is default)
+  -y, --yes            skip the size-confirmation prompt
+
+Queue (state in ~/.hfget):
+  hfget add <model...> [download options]
+                       enqueue model(s); trailing options are stored per entry
+                       (e.g. -i '*Q4_K_M*' --verify). Each model is checked
+                       first: you get a size + contents overview and a
+                       confirmation prompt before it is queued (-y skips).
+                       Gated models are caught here instead of failing later.
+                       Starts a background runner unless --no-start is given.
+  hfget queue [sec]    live watch of the queue: current download with progress,
+                       pending and failed entries; refreshes every SEC seconds
+                       (default: 1) until Ctrl-C
+  hfget status         the same view as a one-shot snapshot
+  hfget rm <n|model>   remove a pending entry (number from 'hfget queue')
+  hfget clear [--all]  remove all pending entries; --all wipes the whole queue
+                       (pending + failed + current) and stops the runner
+  hfget retry          re-queue all failed entries
+  hfget stop [--now]   stop after the current model, or immediately (--now);
+                       everything is resumable
+  hfget run            process the queue in the foreground
+  hfget log [model]    tail the current (or named model's) download log
+
+Other:
+  -h, --help           this help
+  -V, --version        print version
+
+Environment:
+  HFGET_DEST           default download dir (e.g. "$HOME/models")
+  HF_NAS_DIR           legacy alias for HFGET_DEST (still honored)
+  HF_TOKEN             HF access token for gated/private models
+  HFGET_STATE_DIR      queue state dir (default: $XDG_STATE_HOME/hfget or ~/.hfget)
+  HFGET_QUEUE_NOSTART  if set, 'add' never auto-starts the runner
+  HFGET_QUEUE_NOWAIT   if set, the runner does not wait for manual downloads
+  HFGET_WARN_GB        size in GB above which the confirmation defaults to No
+                       (default: 100)
+  HFGET_YES            if set, never ask for confirmation (same as -y)
+  HFGET_NOCAFFEINE     if set, do not re-exec under caffeinate (macOS)
+
+Examples:
+  export HFGET_DEST="$HOME/models"                 # e.g. in ~/.zshrc / ~/.bashrc
+  hfget download Qwen/Qwen3-8B
+  hfget add Qwen/Qwen3-8B mistralai/Mistral-7B-Instruct-v0.3 --verify
+  hfget add bartowski/Llama-3.3-70B-Instruct-GGUF -i '*Q4_K_M*'
+  hfget queue
+EOF
+}
+
+if [[ $HFGET_SOURCED -eq 0 ]]; then
+  command -v curl >/dev/null 2>&1 || die "curl is required"
+  command -v jq   >/dev/null 2>&1 || die "jq is required (install it: 'brew install jq', 'sudo apt install jq', or 'sudo dnf install jq')"
+fi
+
+# ---------------------------------------------------------- shared helpers --
+MODEL_ID_RE='^[A-Za-z0-9][A-Za-z0-9._-]*(/[A-Za-z0-9._-]+)?$'
+
+human() {
+  awk -v b="${1:-0}" 'BEGIN {
+    split("B KB MB GB TB PB", u, " "); i = 1
+    while (b >= 1000 && i < 6) { b /= 1000; i++ }
+    if (i == 1) printf "%d %s", b, u[i]; else printf "%.1f %s", b, u[i]
+  }'
+}
+
+# Byte size of a file. GNU stat first (Linux); BSD stat second (macOS). Order
+# matters: `stat -f` on GNU means --file-system and prints a bogus value with
+# exit 0, so the BSD form must be the fallback, never the primary.
+filesize() { stat -c %s "$1" 2>/dev/null || stat -f %z "$1" 2>/dev/null || echo 0; }
+
+# sha256 of a file, portable across Linux (sha256sum) and macOS (shasum).
+# Returns non-zero if neither tool exists (caller treats that as "skip verify").
+sha256() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{ print $1 }'
+  elif command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1" | awk '{ print $1 }'
+  else return 1; fi
+}
+
+# Best-effort creation/start time of a file as an epoch, portable. Tries birth
+# time (GNU %W, then BSD %B), falls back to mtime; prints nothing if unknown.
+file_birth() {
+  local b
+  b=$(stat -c %W "$1" 2>/dev/null || true)                 # GNU birth (0/- if unsupported)
+  case "$b" in ''|0|-) b=$(stat -f %B "$1" 2>/dev/null || true) ;; esac  # BSD birth
+  case "$b" in ''|0|-) b=$(stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || true) ;; esac  # mtime
+  case "$b" in ''|-) b='' ;; esac
+  printf '%s' "$b"
+}
+
+enc_path() { jq -rn --arg p "$1" '$p | split("/") | map(@uri) | join("/")'; }
+
+matches_any() {
+  local p=$1 g
+  shift
+  for g in "$@"; do
+    # shellcheck disable=SC2254
+    case "$p" in $g) return 0 ;; esac
+  done
+  return 1
+}
+
+# Accept pasted URLs like https://huggingface.co/org/model[/tree/rev].
+# Sets NORM_MODEL and NORM_UREV (revision embedded in the URL, or empty).
+normalize_model_id() {
+  local m=$1
+  NORM_UREV=''
+  m=${m#http://}; m=${m#https://}
+  m=${m#www.}; m=${m#huggingface.co/}; m=${m#hf.co/}
+  m=${m%%\?*}; m=${m%/}
+  if [[ $m == */tree/* ]]; then
+    NORM_UREV=${m#*/tree/}
+    m=${m%%/tree/*}
+  fi
+  NORM_MODEL=$m
+}
+
+# Ask a yes/no question on the controlling terminal; $2 is the default (y/n).
+# Non-interactive contexts (stderr not a tty — e.g. the queue runner's
+# download children) and -y/--yes proceed automatically.
+confirm() {
+  local prompt=$1 def=${2:-y} ans
+  if [[ -n ${YES:-} || ! -t 2 || ! -r /dev/tty ]]; then return 0; fi
+  if [[ $def == y ]]; then prompt="$prompt [Y/n] "; else prompt="$prompt [y/N] "; fi
+  printf '%s' "$prompt" >&2
+  IFS= read -r ans </dev/tty || return 1
+  if [[ -z $ans ]]; then ans=$def; fi
+  case "$ans" in
+    y | Y | yes | Yes | YES) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+resolve_token() {
+  local f
+  if [[ -z $TOKEN ]]; then TOKEN=${HF_TOKEN:-}; fi
+  if [[ -z $TOKEN ]]; then
+    for f in "${HF_HOME:-$HOME/.cache/huggingface}/token" "$HOME/.huggingface/token"; do
+      if [[ -r $f ]]; then TOKEN=$(head -n 1 "$f" | tr -d '[:space:]'); break; fi
+    done
+  fi
+}
+
+# Temp dir + auth header file (600 perms so the token never shows up in `ps`).
+setup_net() {
+  TMPD=$(mktemp -d "${TMPDIR:-/tmp}/hfget.XXXXXX")
+  trap 'rm -rf "$TMPD"' EXIT
+  HDRS="$TMPD/headers"
+  : > "$HDRS"; chmod 600 "$HDRS"
+  {
+    printf 'User-Agent: hfget/%s\n' "$VERSION"
+    if [[ -n $TOKEN ]]; then printf 'Authorization: Bearer %s\n' "$TOKEN"; fi
+  } >> "$HDRS"
+}
+
+NEXT_URL=''
+api_get() {
+  local url=$1 code msg=''
+  code=$(curl -sS -H @"$HDRS" -D "$TMPD/rhdr" -o "$TMPD/body" -w '%{http_code}' \
+              --connect-timeout 15 --retry 2 "$url" </dev/null) \
+    || die "network error contacting huggingface.co (curl exit $?)"
+  if [[ $code != 200 ]]; then
+    msg=$(jq -r '.error // empty' "$TMPD/body" 2>/dev/null | head -n 1) || msg=''
+  fi
+  case "$code" in
+    200) ;;
+    401) die "authentication failed (HTTP 401${msg:+: $msg}). Pass a valid token via -t or \$HF_TOKEN (create one at $HF/settings/tokens)" ;;
+    403) die "access denied (HTTP 403${msg:+: $msg}). This looks like a gated model: open $HF/$MODEL in a browser, accept the license, then retry with a token (-t / \$HF_TOKEN)" ;;
+    404) die "not found (HTTP 404): $HF/$MODEL at revision '$REV'${msg:+ ($msg)}. Check the model id and revision; private repos also need a token" ;;
+    *)   die "HuggingFace API returned HTTP $code${msg:+: $msg}" ;;
+  esac
+  NEXT_URL=$(tr -d '\r' < "$TMPD/rhdr" | grep -i '^link:' \
+             | sed -n 's/.*<\([^>]*\)>[[:space:]]*;[[:space:]]*rel="next".*/\1/p' \
+             | head -n 1) || NEXT_URL=''
+}
+
+# Fetch the recursive file tree of $MODEL @ $REV into $TMPD/files.tsv
+# (size \t lfs-sha \t path). Sets REV_ENC and FILES_TSV.
+fetch_tree() {
+  REV_ENC=$(jq -rn --arg r "$REV" '$r | @uri')
+  FILES_TSV="$TMPD/files.tsv"; : > "$FILES_TSV"
+  local url="$HF/api/models/$MODEL/tree/$REV_ENC?recursive=true"
+  while [[ -n $url ]]; do
+    api_get "$url"
+    jq -r '.[] | select(.type == "file") | [(.size // 0), (.lfs.oid // "-"), .path] | @tsv' \
+      "$TMPD/body" >> "$FILES_TSV"
+    url=$NEXT_URL
+  done
+  [[ -s $FILES_TSV ]] || die "no files found in $MODEL at revision '$REV'"
+}
+
+# Apply INCLUDES/EXCLUDES globs to FILES_TSV → SEL_TSV (callers check -s).
+apply_filters() {
+  SEL_TSV="$TMPD/selected.tsv"; : > "$SEL_TSV"
+  local size lfs path
+  while IFS=$'\t' read -r size lfs path; do
+    if [[ ${#INCLUDES[@]} -gt 0 ]] && ! matches_any "$path" "${INCLUDES[@]}"; then continue; fi
+    if [[ ${#EXCLUDES[@]} -gt 0 ]] && matches_any "$path" "${EXCLUDES[@]}"; then continue; fi
+    printf '%s\t%s\t%s\n' "$size" "$lfs" "$path" >> "$SEL_TSV"
+  done < "$FILES_TSV"
+}
+
+# HEAD the first selected file; sets PROBE_CODE (gated repos answer 401/403).
+auth_probe_first() {
+  local fp
+  fp=$(head -n 1 "$1" | cut -f3-)
+  PROBE_CODE=$(curl -sIL -H @"$HDRS" -o /dev/null -w '%{http_code}' --connect-timeout 15 \
+                    "$HF/$MODEL/resolve/$REV_ENC/$(enc_path "$fp")" </dev/null) \
+    || die "network error contacting huggingface.co (curl exit $?)"
+}
+
+# Grouped size breakdown of a selection TSV, plus the largest files. Warns
+# when the selection carries several alternative GGUF quants. Sets OV_NGGUF.
+overview_tsv() {
+  local tsv=$1 label cnt bytes ext path
+  label="contents:     "
+  while IFS=$'\t' read -r cnt bytes ext; do
+    info "$label$(printf '%4d × %-12s' "$cnt" "$ext") $(human "$bytes")"
+    label="              "
+  done < <(awk -F '\t' '{
+      e = $3
+      sub(/^.*\//, "", e)
+      if (e ~ /\./) { sub(/^.*\./, "", e) } else { e = "(no ext)" }
+      c[tolower(e)]++; s[tolower(e)] += $1
+    } END { for (e in c) printf "%d\t%d\t%s\n", c[e], s[e], e }' "$tsv" \
+    | sort -t$'\t' -k2,2nr | head -n 8)
+  label="largest:      "
+  while IFS=$'\t' read -r bytes path; do
+    info "$label$(printf '%-10s' "$(human "$bytes")") $path"
+    label="              "
+  done < <(sort -t$'\t' -k1,1nr "$tsv" | head -n 3 | cut -f1,3)
+  OV_NGGUF=$(awk -F '\t' '$3 ~ /\.[Gg][Gg][Uu][Ff]$/ && $1 > 100000000 { g++ } END { print g + 0 }' "$tsv")
+  if [[ $OV_NGGUF -ge 3 ]]; then
+    warn "this selection includes $OV_NGGUF alternative GGUF quantization files — usually you want ONE (e.g. -i '*Q4_K_M*'), not all of them"
+  fi
+}
+
+# Confirmation before committing to a download/queue; non-zero means abort.
+# Above HFGET_WARN_GB (default 100 GB), or on GGUF quant spam, default is No.
+size_guard() {
+  local bytes=$1 verb=$2 warn_bytes
+  warn_bytes=$(( ${HFGET_WARN_GB:-100} * 1000000000 ))
+  if [[ $bytes -ge $warn_bytes || ${OV_NGGUF:-0} -ge 3 ]]; then
+    confirm "$verb $(human "$bytes") anyway?" n
+  else
+    confirm "$verb $(human "$bytes") — continue?" y
+  fi
+}
+
+# ===========================================================================
+#  download command
+# ===========================================================================
+cmd_download() {
+
+MODEL='' BASE='' REV='main' TOKEN=''
+LIST=0 DRYRUN=0 JOBS=1 VERIFY=0 REQUIRE_MOUNT=0
+INCLUDES=() EXCLUDES=()
+
+need_val() { [[ $# -ge 2 ]] || die "option $1 requires a value"; }
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -r|--revision)  need_val "$@"; REV=$2; shift 2 ;;
+    -i|--include)   need_val "$@"; INCLUDES+=("$2"); shift 2 ;;
+    -x|--exclude)   need_val "$@"; EXCLUDES+=("$2"); shift 2 ;;
+    -l|--list)      LIST=1; shift ;;
+    -n|--dry-run)   DRYRUN=1; shift ;;
+    -t|--token)     need_val "$@"; TOKEN=$2; shift 2 ;;
+    -j|--jobs)      need_val "$@"; JOBS=$2; shift 2 ;;
+    --verify)       VERIFY=1; shift ;;
+    --require-mount) REQUIRE_MOUNT=1; shift ;;
+    --force-local)  shift ;;   # deprecated: local is now the default (accepted, no-op)
+    -y|--yes)       YES=1; shift ;;
+    -V|--version)   echo "hfget $VERSION"; exit 0 ;;
+    -h|--help)      usage; exit 0 ;;
+    -*)             die "unknown option: $1 (see --help)" ;;
+    *)  if [[ -z $MODEL ]]; then MODEL=$1
+        elif [[ -z $BASE ]]; then BASE=$1
+        else die "unexpected argument: $1"
+        fi
+        shift ;;
+  esac
+done
+
+[[ -n $MODEL ]] || { usage >&2; exit 1; }
+jobs_re='^[0-9]+$'
+[[ $JOBS =~ $jobs_re ]] && [[ $JOBS -ge 1 && $JOBS -le 16 ]] || die "--jobs must be a number between 1 and 16"
+
+normalize_model_id "$MODEL"
+MODEL=$NORM_MODEL
+if [[ -n $NORM_UREV && $REV == main ]]; then REV=$NORM_UREV; fi
+[[ $MODEL =~ $MODEL_ID_RE ]] || die "'$MODEL' does not look like a HuggingFace model id (expected: org/model)"
+
+# ------------------------------------------------------------ token & temp --
+resolve_token
+setup_net
+
+# shellcheck disable=SC2329  # invoked via trap
+on_interrupt() {
+  trap - INT TERM
+  printf '\n' >&2
+  warn "interrupted — partial *.part files are kept; rerun the same command to resume"
+  rm -rf "$TMPD"
+  pids=$(jobs -pr 2>/dev/null || true)
+  # shellcheck disable=SC2086
+  if [[ -n $pids ]]; then kill $pids 2>/dev/null || true; fi
+  exit 130
+}
+trap on_interrupt INT TERM
+
+# ------------------------------------------------------- file list & filters --
+info "${C_DIM}fetching file list: $MODEL @ $REV${C_OFF}"
+fetch_tree
+apply_filters
+[[ -s $SEL_TSV ]] || die "no files match the given --include/--exclude filters"
+
+# ------------------------------------------------------------------- --list --
+if [[ $LIST -eq 1 ]]; then
+  n=0; total=0
+  while IFS=$'\t' read -r size lfs path; do
+    marker=' '
+    if [[ $lfs != "-" ]]; then marker='L'; fi
+    printf '%10s %s %s\n' "$(human "$size")" "$marker" "$path"
+    n=$((n + 1)); total=$((total + size))
+  done < "$SEL_TSV"
+  echo "-----"
+  printf '%10s   %d files  (L = large file stored in LFS)\n' "$(human "$total")" "$n"
+  exit 0
+fi
+
+# ------------------------------------------------- destination & safety nets --
+if [[ -z $BASE ]]; then BASE=${HFGET_DEST:-${HF_NAS_DIR:-}}; fi
+[[ -n $BASE ]] || die "no destination: pass a base dir as the 2nd argument, or set HFGET_DEST (e.g. export HFGET_DEST=\"\$HOME/models\")"
+
+probe=$BASE
+while [[ ! -d $probe && $probe != / && $probe != . ]]; do probe=$(dirname "$probe"); done
+fs_dev=$(df -P "$probe" 2>/dev/null | awk 'NR == 2 { print $1 }')
+is_netmount=0
+case "$fs_dev" in //* | *:*) is_netmount=1 ;; esac  # SMB/AFP (//host/share) or NFS (host:/export)
+
+# Any destination is allowed by default. Two targeted safety nets:
+#  1. --require-mount: opt-in strictness for NAS workflows.
+if [[ $REQUIRE_MOUNT -eq 1 && $is_netmount -eq 0 ]]; then
+  die "--require-mount: destination '$BASE' is not on a network mount (filesystem: ${fs_dev:-unknown}).
+Mount the share first, or drop --require-mount to allow a local destination."
+fi
+#  2. macOS /Volumes trap: a /Volumes/<share> path that resolves to the boot
+#     disk means the share isn't mounted — writing there fills the local disk.
+case "$BASE" in
+  /Volumes/*)
+    if [[ $is_netmount -eq 0 ]]; then
+      warn "'$BASE' is under /Volumes but resolves to the local disk ($fs_dev) — the network share may not be mounted. Mount it first if you meant the NAS (or pass --require-mount to make this an error)."
+    fi ;;
+esac
+
+# NB: the destination directory is created only after ALL pre-flight checks
+# pass (auth probe included), so a refused or dry-run download leaves nothing
+# behind on the NAS.
+DEST="$BASE/$MODEL"
+
+# -------------------------------------------------------------- pre-flight --
+WORK_TSV="$TMPD/work.tsv"; : > "$WORK_TSV"
+n_sel=0 n_have=0 n_work=0 sel_bytes=0 need_bytes=0
+while IFS=$'\t' read -r size lfs path; do
+  n_sel=$((n_sel + 1)); sel_bytes=$((sel_bytes + size))
+  out="$DEST/$path"
+  if [[ -f $out && $(filesize "$out") -eq $size ]]; then
+    n_have=$((n_have + 1))
+    continue
+  fi
+  have=0
+  if [[ -f "$out.part" ]]; then have=$(filesize "$out.part"); fi
+  if [[ $have -gt $size ]]; then have=0; fi
+  need_bytes=$((need_bytes + size - have))
+  n_work=$((n_work + 1))
+  printf '%s\t%s\t%s\t%s\n' "$n_work" "$size" "$lfs" "$path" >> "$WORK_TSV"
+done < "$SEL_TSV"
+
+avail_bytes=$(( $(df -Pk "$probe" | awk 'NR == 2 { print $4 }') * 1024 ))
+
+info "model:        $MODEL @ $REV"
+info "destination:  $DEST"
+info "files:        $n_sel selected, $(human "$sel_bytes") total"
+info "already have: $n_have file(s); to download: $n_work file(s), $(human "$need_bytes")"
+info "free space:   $(human "$avail_bytes") on $fs_dev"
+overview_tsv "$SEL_TSV"
+
+if [[ $n_work -eq 0 ]]; then
+  info "${C_GRN}nothing to do — all files are already complete at the destination${C_OFF}"
+  exit 0
+fi
+
+# Cheap auth probe: gated repos serve their file list publicly and only reject
+# the actual download, so HEAD the first selected file before doing any work.
+auth_probe_first "$SEL_TSV"
+case "$PROBE_CODE" in
+  200) ;;
+  401|403) die "downloads are denied (HTTP $PROBE_CODE) — this is a gated or private model. Open $HF/$MODEL in a browser, accept the license, then retry with an access token (-t / \$HF_TOKEN, create one at $HF/settings/tokens)" ;;
+  *)   warn "unexpected HTTP $PROBE_CODE probing the first file — attempting the download anyway" ;;
+esac
+
+if [[ $need_bytes -gt $avail_bytes ]]; then
+  die "not enough free space at the destination ($(human "$need_bytes") needed, $(human "$avail_bytes") available)"
+fi
+if [[ $DRYRUN -eq 1 ]]; then
+  info "${C_DIM}dry run — nothing downloaded${C_OFF}"
+  exit 0
+fi
+
+if ! size_guard "$need_bytes" "download"; then
+  die "aborted — nothing was downloaded"
+fi
+
+# All checks passed — only now touch the filesystem.
+if ! mkdir -p "$DEST" 2>"$TMPD/mkdir.err"; then
+  mkdir_err=$(cat "$TMPD/mkdir.err" 2>/dev/null || true)
+  hint=''
+  case "$BASE" in /Volumes/*)
+    hint="
+If the share IS mounted, this is usually macOS privacy protection: give your
+terminal app access to network volumes under System Settings → Privacy &
+Security → Files and Folders (or Full Disk Access), then restart the terminal." ;;
+  esac
+  die "cannot create destination directory: $DEST
+${mkdir_err}${hint}"
+fi
+
+# ---------------------------------------------------------------- download --
+# When the queue runner set HFGET_PROG, log exact byte progress there so the
+# watcher can show a real percentage: T = total bytes this run must download,
+# C = file now in flight (size, resume offset, path), F = bytes a finished
+# file contributed.
+PROGF=${HFGET_PROG:-}
+if [[ -n $PROGF ]]; then printf 'T\t%s\n' "$need_bytes" > "$PROGF"; fi
+
+RESULTS="$TMPD/results"; : > "$RESULTS"
+# Progress bars only for sequential runs on a real terminal; otherwise print
+# one clean line per completed file.
+QUIET=0; if [[ $JOBS -gt 1 || ! -t 2 ]]; then QUIET=1; fi
+
+fetch_one() {
+  local idx=$1 size=$2 lfs=$3 path=$4
+  local out="$DEST/$path" part url have got rc code attempt start_have sum
+  part="$out.part"
+  mkdir -p "$(dirname "$out")"
+
+  if [[ -f $out && $(filesize "$out") -eq $size ]]; then
+    printf 'SKIP\t0\t%s\n' "$path" >> "$RESULTS"
+    return 0
+  fi
+
+  url="$HF/$MODEL/resolve/$REV_ENC/$(enc_path "$path")"
+  if [[ ! -f $part ]]; then : > "$part"; fi
+  have=$(filesize "$part")
+  if [[ $have -gt $size ]]; then : > "$part"; have=0; fi
+  start_have=$have
+  if [[ -n ${PROGF:-} ]]; then printf 'C\t%s\t%s\t%s\n' "$size" "$start_have" "$path" >> "$PROGF"; fi
+
+  if [[ $QUIET -eq 0 ]]; then
+    if [[ $start_have -gt 0 ]]; then
+      info "[$idx/$n_work] $path ($(human "$size")) ${C_DIM}— resuming at $(human "$start_have")${C_OFF}"
+    else
+      info "[$idx/$n_work] $path ($(human "$size"))"
+    fi
+  elif [[ $start_have -gt 0 ]]; then
+    info "[$idx/$n_work] resuming $path at $(human "$start_have") of $(human "$size")"
+  fi
+
+  attempt=1
+  while :; do
+    rc=0 code=200
+    if [[ $(filesize "$part") -lt $size ]]; then
+      if [[ $QUIET -eq 1 ]]; then
+        code=$(curl -fsSL -H @"$HDRS" --connect-timeout 15 --retry 2 --retry-delay 2 \
+                    --speed-limit 1024 --speed-time 60 \
+                    -C - -o "$part" -w '%{http_code}' "$url" </dev/null) || rc=$?
+      else
+        code=$(curl -fSL --progress-bar -H @"$HDRS" --connect-timeout 15 --retry 2 --retry-delay 2 \
+                    --speed-limit 1024 --speed-time 60 \
+                    -C - -o "$part" -w '%{http_code}' "$url" </dev/null) || rc=$?
+      fi
+    fi
+    got=$(filesize "$part")
+    if [[ $rc -eq 0 && $got -eq $size ]]; then break; fi
+    if [[ $got -gt $size ]]; then : > "$part"; fi
+    case "$code" in
+      401 | 403)
+        warn "[$idx/$n_work] FAILED: $path (HTTP $code — gated/private model; accept the license at $HF/$MODEL and pass a token via -t / \$HF_TOKEN)"
+        printf 'FAIL\t0\t%s\n' "$path" >> "$RESULTS"
+        return 1 ;;
+      404)
+        warn "[$idx/$n_work] FAILED: $path (HTTP 404 — the file vanished from the repo?)"
+        printf 'FAIL\t0\t%s\n' "$path" >> "$RESULTS"
+        return 1 ;;
+    esac
+    if [[ $attempt -ge 3 ]]; then
+      warn "[$idx/$n_work] FAILED: $path (curl exit $rc, HTTP $code; have $(human "$got") of $(human "$size"))"
+      printf 'FAIL\t0\t%s\n' "$path" >> "$RESULTS"
+      return 1
+    fi
+    attempt=$((attempt + 1))
+    sleep 2
+  done
+
+  if [[ $VERIFY -eq 1 && $lfs != "-" ]]; then
+    sum=$(sha256 "$part" 2>/dev/null || echo '')
+    if [[ -z $sum ]]; then
+      warn "[$idx/$n_work] --verify: no sha256sum/shasum found — skipping checksum for $path"
+    elif [[ $sum != "$lfs" ]]; then
+      rm -f "$part"
+      warn "[$idx/$n_work] sha256 MISMATCH: $path — partial removed; rerun to re-download"
+      printf 'FAIL\t0\t%s\n' "$path" >> "$RESULTS"
+      return 1
+    fi
+  fi
+
+  mv -f "$part" "$out"
+  printf 'OK\t%s\t%s\n' "$((size - start_have))" "$path" >> "$RESULTS"
+  if [[ -n ${PROGF:-} ]]; then printf 'F\t%s\n' "$((size - start_have))" >> "$PROGF"; fi
+  if [[ $QUIET -eq 1 ]]; then
+    info "[$idx/$n_work] ${C_GRN}done${C_OFF} $path ($(human "$size"))"
+  elif [[ $VERIFY -eq 1 && $lfs != "-" ]]; then
+    info "[$idx/$n_work] ${C_GRN}sha256 ok${C_OFF}"
+  fi
+  return 0
+}
+
+info ""
+SECONDS=0
+if [[ $JOBS -eq 1 ]]; then
+  while IFS=$'\t' read -r idx size lfs path; do
+    fetch_one "$idx" "$size" "$lfs" "$path" || true
+  done < "$WORK_TSV"
+else
+  info "${C_DIM}downloading with $JOBS parallel jobs${C_OFF}"
+  while IFS=$'\t' read -r idx size lfs path; do
+    while [[ $(jobs -pr | wc -l) -ge $JOBS ]]; do sleep 0.3; done
+    fetch_one "$idx" "$size" "$lfs" "$path" &
+  done < "$WORK_TSV"
+  wait
+fi
+elapsed=$SECONDS
+
+# ----------------------------------------------------------------- summary --
+read -r n_ok n_skip n_fail dl_bytes <<< "$(awk -F '\t' '
+  $1 == "OK"   { ok++; b += $2 }
+  $1 == "SKIP" { sk++ }
+  $1 == "FAIL" { f++ }
+  END { printf "%d %d %d %d", ok + 0, sk + 0, f + 0, b + 0 }' "$RESULTS")"
+
+info ""
+mins=$((elapsed / 60)); secs=$((elapsed % 60))
+rate=''
+if [[ $elapsed -gt 0 && $dl_bytes -gt 0 ]]; then rate=" (avg $(human $((dl_bytes / elapsed)))/s)"; fi
+
+if [[ $n_fail -gt 0 ]]; then
+  warn "$n_fail file(s) failed:"
+  awk -F '\t' '$1 == "FAIL" { print "  - " $3 }' "$RESULTS" >&2
+  info "downloaded $(human "$dl_bytes") in ${mins}m${secs}s${rate} before failing"
+  die "rerun the same command to retry — completed files are skipped, partial files resume"
+fi
+
+info "${C_GRN}done:${C_OFF} $n_ok file(s) downloaded, $(human "$dl_bytes") in ${mins}m${secs}s${rate}"
+if [[ $((n_have + n_skip)) -gt 0 ]]; then
+  info "      $((n_have + n_skip)) file(s) were already complete and skipped"
+fi
+info "      → $DEST"
+exit 0
+
+}
+
+# ===========================================================================
+#  queue machinery
+# ===========================================================================
+QF="$QDIR/queue.tsv"      # pending entries: model \t added \t arg \t arg...
+CF="$QDIR/current.tsv"    # the entry being processed
+FF="$QDIR/failed.tsv"     # failed entries (same format, for retry)
+DL="$QDIR/done.log"       # history
+RP="$QDIR/runner.pid"
+RL="$QDIR/runner.log"
+SF="$QDIR/stop"           # flag: stop after current model
+CLP="$QDIR/current.logpath"
+PGF="$QDIR/progress"      # reporter-written live progress for the watcher
+CPF="$QDIR/childprog"     # download-child event log: T total / C current / F finished
+LOCKD="$QDIR/lock"
+
+q_init() {
+  mkdir -p "$QDIR/logs"
+  local f
+  for f in "$QF" "$CF" "$FF" "$DL" "$RL"; do
+    if [[ ! -f $f ]]; then : > "$f"; fi
+  done
+}
+
+q_lock() {
+  local tries=0 lpid
+  until mkdir "$LOCKD" 2>/dev/null; do
+    lpid=$(cat "$LOCKD/pid" 2>/dev/null || true)
+    if [[ -n $lpid ]] && ! kill -0 "$lpid" 2>/dev/null; then
+      rm -rf "$LOCKD"
+      continue
+    fi
+    tries=$((tries + 1))
+    if [[ $tries -gt 150 ]]; then die "queue lock is stuck ($LOCKD) — remove it if no hfget is running"; fi
+    sleep 0.2
+  done
+  echo $$ > "$LOCKD/pid"
+}
+q_unlock() { rm -rf "$LOCKD"; }
+
+runner_alive() {
+  local p
+  p=$(cat "$RP" 2>/dev/null || true)
+  [[ -n $p ]] && kill -0 "$p" 2>/dev/null
+}
+
+rlog() { printf '%s %s\n' "$(date '+%F %T')" "$*" >> "$RL"; }
+
+# Parse one queue line into ENTRY_MODEL / ENTRY_ARGS.
+# NB: no array slicing here — bash 3.2 collapses a quoted "${a[@]:n}" into one
+# space-joined word while IFS is tab, so the args are copied element by element.
+parse_entry() {
+  ENTRY_COLS=()
+  IFS=$'\t' read -r -a ENTRY_COLS <<< "$1"
+  ENTRY_MODEL=${ENTRY_COLS[0]:-}
+  ENTRY_ARGS=()
+  local i
+  for (( i = 2; i < ${#ENTRY_COLS[@]}; i++ )); do
+    ENTRY_ARGS+=("${ENTRY_COLS[$i]}")
+  done
+}
+
+# Pids of hfget download processes that are NOT this process, its child, or a
+# queue subcommand. Catches manual runs (v1 style and 'hfget download').
+foreign_hfget_pids() {
+  local name
+  name=$(basename "$SELF")
+  ps -axww -o pid,ppid,command | awk -v me="$$" -v child="${RUN_CHILD:-0}" -v name="$name" '
+    index($0, name) == 0 { next }
+    /awk|grep/ { next }
+    { pid = $1; ppid = $2 }
+    pid == me || ppid == me { next }
+    (child != 0) && (pid == child || ppid == child) { next }
+    / (add|queue|status|rm|clear|retry|stop|run|log|help)( |$)/ { next }
+    { print pid }
+  ' | tr '\n' ' ' | sed 's/ *$//'
+}
+
+q_maybe_start_runner() {
+  if runner_alive; then
+    info "runner already active (pid $(cat "$RP"))"
+    return 0
+  fi
+  rm -f "$SF"
+  HFGET_CAFFEINATED='' nohup "$SELF" run --daemon >> "$RL" 2>&1 &
+  disown 2>/dev/null || true
+  sleep 1
+  if runner_alive; then
+    info "${C_GRN}background runner started${C_OFF} (pid $(cat "$RP")) — watch with: hfget queue"
+  else
+    warn "runner did not start — check $RL"
+  fi
+}
+
+# ---------------------------------------------------------------- commands --
+cmd_add() {
+  q_init
+  local nostart=${HFGET_QUEUE_NOSTART:-}
+  local models=() mrevs=() shared=() parsing_models=1 a n_added=0
+  TOKEN=''
+  INCLUDES=() EXCLUDES=()
+  for a in "$@"; do
+    if [[ $a == --no-start ]]; then nostart=1; continue; fi
+    if [[ $a == -y || $a == --yes ]]; then YES=1; continue; fi
+    if [[ $parsing_models -eq 1 && $a != -* && $a != /* && $a != .* ]]; then
+      normalize_model_id "$a"
+      if [[ $NORM_MODEL =~ $MODEL_ID_RE ]]; then
+        models+=("$NORM_MODEL"); mrevs+=("$NORM_UREV")
+        continue
+      fi
+    fi
+    parsing_models=0
+    case "$a" in
+      *$'\t'* | *$'\n'*) die "arguments may not contain tabs or newlines: '$a'" ;;
+    esac
+    shared+=("$a")
+  done
+  [[ ${#models[@]} -gt 0 ]] || die "usage: hfget add <model...> [download options]"
+
+  # Mirror the filter/revision/token flags so the pre-queue preview matches
+  # what the download will actually select.
+  local prev_rev='' i=0 nsh=${#shared[@]}
+  while [[ $i -lt $nsh ]]; do
+    a=${shared[$i]}
+    case "$a" in
+      -i|--include)  i=$((i + 1)); if [[ $i -lt $nsh ]]; then INCLUDES+=("${shared[$i]}"); fi ;;
+      -x|--exclude)  i=$((i + 1)); if [[ $i -lt $nsh ]]; then EXCLUDES+=("${shared[$i]}"); fi ;;
+      -r|--revision) i=$((i + 1)); if [[ $i -lt $nsh ]]; then prev_rev=${shared[$i]}; fi ;;
+      -t|--token)    i=$((i + 1)); if [[ $i -lt $nsh ]]; then TOKEN=${shared[$i]}; fi ;;
+    esac
+    i=$((i + 1))
+  done
+
+  # Resolve the destination NOW and bake it into every entry, so a queued
+  # download can never fail later because the runner lacks HF_NAS_DIR.
+  local base='' base_from_env=0
+  for a in ${shared[@]+"${shared[@]}"}; do
+    case "$a" in /*) base=$a; break ;; esac
+  done
+  if [[ -z $base ]]; then
+    base=${HFGET_DEST:-${HF_NAS_DIR:-}}
+    base_from_env=1
+  fi
+  [[ -n $base ]] || die "no destination: pass a base dir (e.g. hfget add <model> \"\$HOME/models\") or set HFGET_DEST — refusing to queue entries that would fail at download time"
+  if [[ $base_from_env -eq 1 ]]; then
+    shared+=("$base")
+  fi
+  local fsp=$base
+  while [[ ! -d $fsp && $fsp != / && $fsp != . ]]; do fsp=$(dirname "$fsp"); done
+  info "destination:  $base ($(human $(( $(df -Pk "$fsp" | awk 'NR == 2 { print $4 }') * 1024 ))) free)"
+
+  resolve_token
+  setup_net
+
+  # Check every model against the API before it may enter the queue: size and
+  # contents overview, gated-model detection, and a confirmation prompt.
+  local ts m rev pos line total count
+  ts=$(date -u +%FT%TZ)
+  for i in $(seq 0 $(( ${#models[@]} - 1 ))); do
+    m=${models[$i]}
+    if cut -f1 "$QF" "$CF" 2>/dev/null | grep -qxF "$m"; then
+      warn "$m is already queued or downloading — skipped"
+      continue
+    fi
+    rev=${prev_rev:-${mrevs[$i]:-}}
+    if [[ -z $rev ]]; then rev=main; fi
+    MODEL=$m
+    REV=$rev
+    info ""
+    info "${C_DIM}checking $m @ $rev …${C_OFF}"
+    fetch_tree
+    apply_filters
+    if [[ ! -s $SEL_TSV ]]; then
+      warn "$m: no files match the given --include/--exclude filters — skipped"
+      continue
+    fi
+    auth_probe_first "$SEL_TSV"
+    case "$PROBE_CODE" in
+      401 | 403)
+        warn "$m is gated or private (HTTP $PROBE_CODE) — open $HF/$m in a browser, accept the license, store a read token (\$HF_TOKEN or ~/.cache/huggingface/token), then add it again. Skipped."
+        continue ;;
+    esac
+    total=$(awk -F '\t' '{ t += $1 } END { printf "%d", t + 0 }' "$SEL_TSV")
+    count=$(awk 'END { print NR }' "$SEL_TSV")
+    info "$m: $count files, $(human "$total") total"
+    overview_tsv "$SEL_TSV"
+    if ! size_guard "$total" "queue"; then
+      info "skipped $m"
+      continue
+    fi
+    line=$(printf '%s\t%s' "$m" "$ts")
+    if [[ -n ${mrevs[$i]} ]]; then
+      line=$(printf '%s\t%s\t%s' "$line" "-r" "${mrevs[$i]}")
+    fi
+    for a in ${shared[@]+"${shared[@]}"}; do
+      line=$(printf '%s\t%s' "$line" "$a")
+    done
+    q_lock
+    printf '%s\n' "$line" >> "$QF"
+    pos=$(wc -l < "$QF" | tr -d ' ')
+    q_unlock
+    info "${C_GRN}queued${C_OFF} ($pos) $m"
+    n_added=$((n_added + 1))
+  done
+
+  info ""
+  if [[ $n_added -eq 0 ]]; then
+    info "nothing queued"
+    exit 0
+  fi
+  if [[ -n $nostart ]]; then
+    info "${C_DIM}runner not started (--no-start) — start with: hfget run${C_OFF}"
+  else
+    q_maybe_start_runner
+  fi
+}
+
+RUN_CHILD=0
+RUN_REPORTER=0
+CUR_ACTIVE=0
+
+# Combines the download child's event log (exact totals, local) with one stat
+# of the in-flight .part (NAS) into a LOCAL progress file for the watcher:
+#   epoch \t percent \t progressed \t total \t current-file \t part-bytes
+# The watcher only ever reads that local file, so its redraws can never stall
+# on slow SMB metadata calls.
+progress_reporter() {
+  local d=$1 total fdone csize coff cpath ps gain prog pct
+  while :; do
+    if [[ -s $CPF ]]; then
+      IFS=$'\t' read -r total fdone csize coff cpath <<< "$(awk -F '\t' '
+        $1 == "T" { t = $2 }
+        $1 == "F" { f += $2 }
+        $1 == "C" { cs = $2; co = $3; cp = $4 }
+        END { printf "%d\t%d\t%d\t%d\t%s", t + 0, f + 0, cs + 0, co + 0, cp }' "$CPF")"
+      gain=0 ps=0
+      if [[ -n $cpath ]]; then
+        ps=$(filesize "$d/$cpath.part")
+        if [[ $ps -gt $coff ]]; then gain=$((ps - coff)); fi
+        if [[ $gain -gt $((csize - coff)) ]]; then gain=$((csize - coff)); fi
+      fi
+      prog=$((fdone + gain))
+      pct=0
+      if [[ $total -gt 0 ]]; then pct=$((prog * 100 / total)); fi
+      if [[ $pct -gt 100 ]]; then pct=100; fi
+      printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$(date +%s)" "$pct" "$prog" "$total" "${cpath##*/}" "$ps" \
+        > "$PGF.tmp" && mv -f "$PGF.tmp" "$PGF"
+    else
+      rm -f "$PGF"
+    fi
+    sleep 3
+  done
+}
+
+stop_reporter() {
+  if [[ $RUN_REPORTER -ne 0 ]]; then
+    kill "$RUN_REPORTER" 2>/dev/null || true
+    wait "$RUN_REPORTER" 2>/dev/null || true
+    RUN_REPORTER=0
+  fi
+  rm -f "$PGF" "$PGF.tmp" "$CPF"
+}
+
+runner_requeue_current() {
+  q_lock
+  if [[ -s $CF ]]; then
+    cat "$CF" "$QF" > "$QF.tmp" && mv "$QF.tmp" "$QF"
+    : > "$CF"
+  fi
+  rm -f "$CLP"
+  q_unlock
+}
+
+runner_int() {
+  trap - INT TERM
+  rlog "runner interrupted — re-queueing current entry and exiting"
+  # If the signal caught us while we held the queue lock, release our own lock
+  # so the re-queue below cannot deadlock.
+  if [[ $(cat "$LOCKD/pid" 2>/dev/null || true) == "$$" ]]; then rm -rf "$LOCKD"; fi
+  if [[ $RUN_CHILD -ne 0 ]]; then
+    kill -TERM -"$RUN_CHILD" 2>/dev/null || kill -TERM "$RUN_CHILD" 2>/dev/null || true
+  fi
+  stop_reporter
+  if [[ $CUR_ACTIVE -eq 1 ]]; then runner_requeue_current; fi
+  rm -f "$RP"
+  exit 130
+}
+
+wait_for_foreign() {
+  if [[ -n ${HFGET_QUEUE_NOWAIT:-} ]]; then return 0; fi
+  local logged=0 pids
+  while :; do
+    pids=$(foreign_hfget_pids)
+    if [[ -z $pids ]]; then break; fi
+    if [[ -f $SF ]]; then return 0; fi
+    if [[ $logged -eq 0 ]]; then
+      rlog "waiting for manual hfget download to finish (pid $pids)"
+      logged=1
+    fi
+    sleep 5  # short interval so 'hfget stop' is honored promptly mid-wait
+  done
+  if [[ $logged -eq 1 ]]; then rlog "manual hfget finished — continuing"; fi
+  return 0
+}
+
+cmd_run() {
+  local daemon=0
+  if [[ ${1:-} == --daemon ]]; then daemon=1; shift; fi
+  q_init
+
+  q_lock
+  if runner_alive; then
+    q_unlock
+    if [[ $daemon -eq 0 ]]; then info "another runner is already active (pid $(cat "$RP"))"; fi
+    exit 0
+  fi
+  echo $$ > "$RP"
+  q_unlock
+
+  rm -f "$SF"
+  set -m
+  trap runner_int INT TERM
+  trap 'rm -f "$RP" "$CLP" "$PGF" "$PGF.tmp" "$CPF"' EXIT
+  rlog "runner started (pid $$)"
+  if [[ $daemon -eq 0 ]]; then info "processing queue (state: $QDIR) — Ctrl-C is safe, everything resumes"; fi
+
+  # Crash recovery: a leftover current entry means a previous runner died.
+  if [[ -s $CF ]]; then
+    rlog "recovering interrupted entry: $(cut -f1 "$CF")"
+    runner_requeue_current
+  fi
+
+  local ok=0 fail=0 line model logf t0 dur rc ts pr_base pr_a
+  while :; do
+    if [[ -f $SF ]]; then
+      rlog "stop requested — exiting (queue keeps its pending entries)"
+      rm -f "$SF"
+      break
+    fi
+
+    wait_for_foreign
+    if [[ -f $SF ]]; then continue; fi  # stop was requested mid-wait
+
+    q_lock
+    if [[ ! -s $QF ]]; then q_unlock; break; fi
+    head -n 1 "$QF" > "$CF"
+    tail -n +2 "$QF" > "$QF.tmp" && mv "$QF.tmp" "$QF"
+    q_unlock
+    CUR_ACTIVE=1
+
+    line=$(head -n 1 "$CF")
+    parse_entry "$line"
+    model=$ENTRY_MODEL
+    logf="$QDIR/logs/$(date +%Y%m%d-%H%M%S)_$(printf '%s' "$model" | tr '/' '_').log"
+    printf '%s\n' "$logf" > "$CLP"
+    rlog "downloading $model → ${logf##*/}"
+    if [[ $daemon -eq 0 ]]; then info "${C_DIM}downloading $model …${C_OFF}"; fi
+
+    t0=$SECONDS
+    rc=0
+    pr_base=''
+    for pr_a in ${ENTRY_ARGS[@]+"${ENTRY_ARGS[@]}"}; do
+      case "$pr_a" in /*) pr_base=$pr_a; break ;; esac
+    done
+    if [[ -z $pr_base ]]; then pr_base=${HFGET_DEST:-${HF_NAS_DIR:-}}; fi
+    rm -f "$CPF"
+    if [[ -n $pr_base ]]; then
+      progress_reporter "$pr_base/$model" &
+      RUN_REPORTER=$!
+    fi
+    HFGET_PROG="$CPF" "$SELF" download "$model" ${ENTRY_ARGS[@]+"${ENTRY_ARGS[@]}"} </dev/null >> "$logf" 2>&1 &
+    RUN_CHILD=$!
+    wait "$RUN_CHILD" || rc=$?
+    RUN_CHILD=0
+    stop_reporter
+    dur=$((SECONDS - t0))
+    ts=$(date -u +%FT%TZ)
+
+    if [[ $rc -eq 0 ]]; then
+      ok=$((ok + 1))
+      printf '%s\t%s\tok\t%ss\t%s\n' "$ts" "$model" "$dur" "$logf" >> "$DL"
+      rlog "done $model (${dur}s)"
+      if [[ $daemon -eq 0 ]]; then info "${C_GRN}done${C_OFF} $model (${dur}s)"; fi
+    else
+      fail=$((fail + 1))
+      q_lock
+      cat "$CF" >> "$FF"
+      q_unlock
+      printf '%s\t%s\tfail\t%ss\t%s\n' "$ts" "$model" "$dur" "$logf" >> "$DL"
+      rlog "FAILED $model (exit $rc) — see ${logf##*/}"
+      if [[ $daemon -eq 0 ]]; then warn "FAILED $model (exit $rc) — see $logf"; fi
+    fi
+
+    q_lock
+    : > "$CF"
+    q_unlock
+    rm -f "$CLP"
+    CUR_ACTIVE=0
+  done
+
+  rlog "queue drained: $ok ok, $fail failed"
+  if [[ $daemon -eq 0 ]]; then info "queue drained: $ok ok, $fail failed"; fi
+  if [[ $fail -gt 0 ]]; then exit 1; fi
+  exit 0
+}
+
+render_status() {
+  q_init
+  if runner_alive; then
+    echo "runner:  ${C_GRN}active${C_OFF} (pid $(cat "$RP"))"
+    if [[ -s $CF ]]; then
+      parse_entry "$(head -n 1 "$CF")"
+      local logf lastline now birth='' el_str=''
+      local p_ts p_pct p_prog p_total p_name p_bytes barf barn filled bi eta_str el rate remain
+      logf=$(cat "$CLP" 2>/dev/null || true)
+      if [[ -n $logf && -f $logf ]]; then
+        now=$(date +%s)
+        birth=$(file_birth "$logf")
+        case "$birth" in ''|*[!0-9]*) birth=$now ;; esac
+        el_str=" ${C_DIM}— $(( (now - birth) / 60 ))m$(( (now - birth) % 60 ))s${C_OFF}"
+      fi
+      echo "current: ${C_GRN}▶${C_OFF} $ENTRY_MODEL$el_str"
+      if [[ -n $logf && -f $logf ]]; then
+        lastline=$(grep '^\[' "$logf" 2>/dev/null | tail -n 1 | tr -d '\r' || true)
+        if [[ -z $lastline ]]; then lastline=$(tail -n 1 "$logf" 2>/dev/null | tr -d '\r' || true); fi
+        if [[ -n $lastline ]]; then echo "         $lastline"; fi
+      fi
+      # Progress bar from the runner's local progress file — the watcher
+      # itself never touches the NAS, so redraws cannot stall on slow SMB
+      # metadata calls.
+      if [[ -f $PGF ]]; then
+        p_ts='' p_pct='' p_prog='' p_total='' p_name='' p_bytes=''
+        # shellcheck disable=SC2034  # p_bytes reserved for future display use
+        IFS=$'\t' read -r p_ts p_pct p_prog p_total p_name p_bytes < "$PGF" || true
+        now=$(date +%s)
+        if [[ $(( now - ${p_ts:-0} )) -lt 30 ]]; then
+          if [[ -n ${p_total:-} && ${p_total:-0} -gt 0 ]]; then
+            filled=$(( ${p_pct:-0} * 24 / 100 ))
+            barf='' barn=''
+            bi=0
+            while [[ $bi -lt 24 ]]; do
+              # NB: braces required — bash 3.2 parses the multibyte block char
+              # into the variable name without them.
+              if [[ $bi -lt $filled ]]; then barf="${barf}█"; else barn="${barn}░"; fi
+              bi=$((bi + 1))
+            done
+            eta_str=''
+            if [[ -n $birth && ${p_prog:-0} -gt 0 ]]; then
+              el=$(( now - birth ))
+              if [[ $el -gt 5 ]]; then
+                rate=$(( p_prog / el ))
+                if [[ $rate -gt 0 ]]; then
+                  remain=$(( (p_total - p_prog) / rate ))
+                  eta_str=" ${C_DIM}~$(( remain / 60 ))m$(( remain % 60 ))s left${C_OFF}"
+                fi
+              fi
+            fi
+            echo "         ↓ ${p_name%.part}"
+            echo "         [${C_GRN}${barf}${C_OFF}${barn}] ${p_pct}%  $(human "${p_prog:-0}") / $(human "$p_total")${eta_str}"
+          elif [[ -n ${p_prog:-} ]]; then
+            # legacy 3-field format from a pre-2.3 runner: epoch, bytes, name
+            echo "         ↓ ${p_prog%.part}  $(human "${p_pct:-0}") so far"
+          fi
+        fi
+      fi
+    else
+      echo "current: (between models — $(tail -n 1 "$RL" 2>/dev/null | cut -c21- || echo 'starting'))"
+    fi
+  else
+    echo "runner:  idle"
+  fi
+
+  local n=0 line
+  echo "pending:"
+  while IFS= read -r line; do
+    [[ -n $line ]] || continue
+    n=$((n + 1))
+    parse_entry "$line"
+    if [[ ${#ENTRY_ARGS[@]} -gt 0 ]]; then
+      printf '  %2d. %s  %s(%s)%s\n' "$n" "$ENTRY_MODEL" "$C_DIM" "${ENTRY_ARGS[*]}" "$C_OFF"
+    else
+      printf '  %2d. %s\n' "$n" "$ENTRY_MODEL"
+    fi
+  done < "$QF"
+  if [[ $n -eq 0 ]]; then echo "  (empty)"; fi
+
+  local nf
+  nf=$(grep -c . "$FF" 2>/dev/null || true)
+  if [[ ${nf:-0} -gt 0 ]]; then
+    echo "failed:  $nf entr$( [[ $nf -eq 1 ]] && echo y || echo ies ) — re-queue with: hfget retry"
+    cut -f1 "$FF" | sed 's/^/  ✗ /'
+  fi
+  local nd
+  nd=$(grep -c $'\tok\t' "$DL" 2>/dev/null || true)
+  if [[ ${nd:-0} -gt 0 ]]; then
+    echo "done:    $nd download(s) completed (history: $DL)"
+  fi
+}
+
+cmd_status() { render_status; }
+
+# Live watch view: redraw the status every second (or a given interval)
+# until Ctrl-C. Falls back to a one-shot snapshot when stdout is not a terminal.
+cmd_queue() {
+  local interval=${1:-1} ival_re='^[0-9]+([.][0-9]+)?$'
+  [[ $interval =~ $ival_re ]] || die "usage: hfget queue [seconds]"
+  if [[ ! -t 1 ]]; then render_status; exit 0; fi
+  trap 'printf "\033[?25h"' EXIT   # restore the cursor on any exit
+  trap 'exit 0' INT TERM
+  printf '\033[?25l'
+  local out
+  while :; do
+    out=$(render_status)
+    printf '\033[H\033[2J%s\n\n%s↻ refreshes every %ss — Ctrl-C to exit (one-shot: hfget status)%s\n' \
+      "$out" "$C_DIM" "$interval" "$C_OFF"
+    sleep "$interval"
+  done
+}
+
+cmd_rm() {
+  q_init
+  [[ $# -ge 1 ]] || die "usage: hfget rm <number|model>"
+  local target=$1 before after
+  q_lock
+  before=$(grep -c . "$QF" || true)
+  if [[ $target =~ ^[0-9]+$ ]]; then
+    awk -v n="$target" 'NR != n' "$QF" > "$QF.tmp" && mv "$QF.tmp" "$QF"
+  else
+    normalize_model_id "$target"
+    awk -F '\t' -v m="$NORM_MODEL" '$1 != m' "$QF" > "$QF.tmp" && mv "$QF.tmp" "$QF"
+  fi
+  after=$(grep -c . "$QF" || true)
+  q_unlock
+  if [[ ${before:-0} -eq ${after:-0} ]]; then
+    warn "no pending entry matched '$target' (see: hfget queue)"
+  else
+    info "removed $((before - after)) entr$( [[ $((before - after)) -eq 1 ]] && echo y || echo ies )"
+  fi
+}
+
+cmd_clear() {
+  q_init
+  local all=0 n nf stopped=0 i
+  if [[ ${1:-} == --all || ${1:-} == -a ]]; then all=1; fi
+
+  if [[ $all -eq 1 ]]; then
+    # Stop an active runner first; its trap re-queues the current entry,
+    # which is then wiped together with everything else.
+    if runner_alive; then
+      info "stopping the runner …"
+      kill -TERM "$(cat "$RP")" 2>/dev/null || true
+      for i in 1 2 3 4 5 6 7 8 9 10; do
+        if ! runner_alive; then break; fi
+        sleep 1
+      done
+      if runner_alive; then
+        warn "runner (pid $(cat "$RP")) did not exit — nothing cleared; try again or kill it manually"
+        exit 1
+      fi
+      stopped=1
+    fi
+    q_lock
+    n=$(grep -c . "$QF" || true)
+    nf=$(grep -c . "$FF" || true)
+    : > "$QF"; : > "$FF"; : > "$CF"
+    q_unlock
+    rm -f "$SF" "$CLP"
+    info "cleared everything: ${n:-0} pending, ${nf:-0} failed$( [[ $stopped -eq 1 ]] && echo ', runner stopped' )"
+    info "${C_DIM}partial *.part files on the NAS are kept — they resume if the model is added again${C_OFF}"
+  else
+    q_lock
+    n=$(grep -c . "$QF" || true)
+    : > "$QF"
+    q_unlock
+    info "cleared ${n:-0} pending entr$( [[ ${n:-0} -eq 1 ]] && echo y || echo ies )"
+    nf=$(grep -c . "$FF" || true)
+    if [[ ${nf:-0} -gt 0 ]]; then
+      info "${C_DIM}note: ${nf} failed entr$( [[ $nf -eq 1 ]] && echo y || echo ies ) kept — 'hfget clear --all' also removes those (and stops the runner)${C_OFF}"
+    fi
+  fi
+}
+
+cmd_retry() {
+  q_init
+  local n
+  q_lock
+  n=$(grep -c . "$FF" || true)
+  if [[ ${n:-0} -gt 0 ]]; then
+    cat "$FF" >> "$QF"
+    : > "$FF"
+  fi
+  q_unlock
+  if [[ ${n:-0} -eq 0 ]]; then
+    info "no failed entries to retry"
+    exit 0
+  fi
+  info "re-queued ${n} failed entr$( [[ $n -eq 1 ]] && echo y || echo ies )"
+  if [[ -z ${HFGET_QUEUE_NOSTART:-} ]]; then q_maybe_start_runner; fi
+}
+
+cmd_stop() {
+  q_init
+  if ! runner_alive; then
+    info "no queue runner is active"
+    exit 0
+  fi
+  if [[ ${1:-} == --now ]]; then
+    kill -TERM "$(cat "$RP")" 2>/dev/null || true
+    info "runner stopped — the interrupted model was re-queued and will resume next run"
+  else
+    touch "$SF"
+    info "runner will stop after the current model (use 'hfget stop --now' to interrupt immediately)"
+  fi
+}
+
+cmd_log() {
+  q_init
+  local logf=''
+  if [[ $# -ge 1 ]]; then
+    normalize_model_id "$1"
+    # shellcheck disable=SC2012  # log names are script-generated, safe charset
+    logf=$(ls -t "$QDIR/logs/"*"_$(printf '%s' "$NORM_MODEL" | tr '/' '_').log" 2>/dev/null | head -n 1 || true)
+    [[ -n $logf ]] || die "no log found for $NORM_MODEL"
+  else
+    logf=$(cat "$CLP" 2>/dev/null || true)
+    if [[ -z $logf || ! -f $logf ]]; then
+      # shellcheck disable=SC2012  # log names are script-generated, safe charset
+      logf=$(ls -t "$QDIR/logs/"*.log 2>/dev/null | head -n 1 || true)
+    fi
+    [[ -n $logf ]] || die "no download logs yet"
+  fi
+  info "${C_DIM}$logf${C_OFF}"
+  if [[ -t 1 ]]; then
+    tail -n 40 -f "$logf"
+  else
+    tail -n 50 "$logf"
+  fi
+}
+
+# ---------------------------------------------------------------- dispatch --
+# Only dispatch when executed as a program; when sourced (tests), stop here so
+# the test harness can call individual functions in isolation.
+if [[ $HFGET_SOURCED -eq 0 ]]; then
+case "${1:-}" in
+  download)       shift; cmd_download "$@" ;;
+  add)            shift; cmd_add "$@" ;;
+  queue)          shift; cmd_queue "$@" ;;
+  status)         shift; cmd_status "$@" ;;
+  rm)             shift; cmd_rm "$@" ;;
+  clear)          shift; cmd_clear "$@" ;;
+  retry)          shift; cmd_retry ;;
+  stop)           shift; cmd_stop "$@" ;;
+  run)            shift; cmd_run "$@" ;;
+  log)            shift; cmd_log "$@" ;;
+  help|-h|--help) usage; exit 0 ;;
+  -V|--version)   echo "hfget $VERSION"; exit 0 ;;
+  '')             usage >&2; exit 1 ;;
+  *)
+    normalize_model_id "$1"
+    if [[ $NORM_MODEL =~ $MODEL_ID_RE ]]; then
+      die "bare model invocation was removed — use: hfget download $NORM_MODEL   (or queue it: hfget add $NORM_MODEL)"
+    fi
+    die "unknown command: '$1' (see: hfget --help)"
+    ;;
+esac
+fi

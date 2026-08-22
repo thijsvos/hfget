@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  shellcheck:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run shellcheck
+        run: shellcheck hfget
+
+  unit:
+    name: unit (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install bats + jq
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            sudo apt-get update && sudo apt-get install -y bats jq
+          else
+            brew install bats-core jq
+          fi
+      - name: Show bash version
+        run: bash --version
+      - name: Run unit tests
+        run: bats tests/unit.bats
+
+  integration:
+    name: integration (network)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install bats + jq
+        run: sudo apt-get update && sudo apt-get install -y bats jq
+      - name: Run integration tests
+        env:
+          HFGET_RUN_NETWORK: "1"
+        run: bats tests/integration.bats
