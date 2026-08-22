@@ -17,7 +17,7 @@
 if [[ "${BASH_SOURCE[0]}" != "${0}" ]]; then HFGET_SOURCED=1; else HFGET_SOURCED=0; fi
 [[ $HFGET_SOURCED -eq 1 ]] || set -euo pipefail
 
-VERSION="2.4.0"
+VERSION="2.5.0"
 HF="https://huggingface.co"
 # State dir: explicit override > XDG state home > ~/.hfget
 if [[ -n ${HFGET_STATE_DIR:-} ]]; then QDIR=$HFGET_STATE_DIR
@@ -25,6 +25,17 @@ elif [[ -n ${XDG_STATE_HOME:-} ]]; then QDIR="$XDG_STATE_HOME/hfget"
 else QDIR="$HOME/.hfget"; fi
 SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 YES=${HFGET_YES:-}   # -y/--yes or HFGET_YES=1 skips all confirmation prompts
+
+# Self-healing transfer floor: if a download stalls below MIN_SPEED bytes/sec
+# for SPEED_TIME seconds, curl aborts and hfget reconnects (resuming from the
+# .part) — so one degraded connection can't crawl for hours. A reconnect that
+# keeps making progress is never treated as a failure. Set HFGET_MIN_SPEED=0
+# to disable (e.g. on a very slow link).
+MIN_SPEED=${HFGET_MIN_SPEED:-1048576}   # bytes/sec, default 1 MB/s
+SPEED_TIME=${HFGET_SPEED_TIME:-30}      # sustained seconds before aborting
+case "$MIN_SPEED"  in ''|*[!0-9]*) MIN_SPEED=1048576 ;; esac
+case "$SPEED_TIME" in ''|*[!0-9]*) SPEED_TIME=30 ;; esac
+[[ $MIN_SPEED -ge 1 ]] || MIN_SPEED=1   # 0 → effectively disabled
 
 # Keep the machine awake for the duration of the run (model pulls can take
 # hours). macOS: caffeinate. Cleanly skipped where caffeinate is absent (Linux).
@@ -100,6 +111,9 @@ Environment:
   HFGET_WARN_GB        size in GB above which the confirmation defaults to No
                        (default: 100)
   HFGET_YES            if set, never ask for confirmation (same as -y)
+  HFGET_MIN_SPEED      reconnect if a transfer stalls below this many bytes/sec
+                       (default 1048576 = 1 MB/s; set 0 to disable self-healing)
+  HFGET_SPEED_TIME     seconds a stall must persist before reconnecting (default 30)
   HFGET_NOCAFFEINE     if set, do not re-exec under caffeinate (macOS)
 
 Examples:
@@ -505,7 +519,7 @@ QUIET=0; if [[ $JOBS -gt 1 || ! -t 2 ]]; then QUIET=1; fi
 
 fetch_one() {
   local idx=$1 size=$2 lfs=$3 path=$4
-  local out="$DEST/$path" part url have got rc code attempt start_have sum
+  local out="$DEST/$path" part url have got rc code stall pre start_have sum
   part="$out.part"
   mkdir -p "$(dirname "$out")"
 
@@ -531,23 +545,24 @@ fetch_one() {
     info "[$idx/$n_work] resuming $path at $(human "$start_have") of $(human "$size")"
   fi
 
-  attempt=1
+  stall=0
   while :; do
     rc=0 code=200
-    if [[ $(filesize "$part") -lt $size ]]; then
+    pre=$(filesize "$part")
+    if [[ $pre -lt $size ]]; then
       if [[ $QUIET -eq 1 ]]; then
         code=$(curl -fsSL -H @"$HDRS" --connect-timeout 15 --retry 2 --retry-delay 2 \
-                    --speed-limit 1024 --speed-time 60 \
+                    --speed-limit "$MIN_SPEED" --speed-time "$SPEED_TIME" \
                     -C - -o "$part" -w '%{http_code}' "$url" </dev/null) || rc=$?
       else
         code=$(curl -fSL --progress-bar -H @"$HDRS" --connect-timeout 15 --retry 2 --retry-delay 2 \
-                    --speed-limit 1024 --speed-time 60 \
+                    --speed-limit "$MIN_SPEED" --speed-time "$SPEED_TIME" \
                     -C - -o "$part" -w '%{http_code}' "$url" </dev/null) || rc=$?
       fi
     fi
     got=$(filesize "$part")
     if [[ $rc -eq 0 && $got -eq $size ]]; then break; fi
-    if [[ $got -gt $size ]]; then : > "$part"; fi
+    if [[ $got -gt $size ]]; then : > "$part"; got=0; fi
     case "$code" in
       401 | 403)
         warn "[$idx/$n_work] FAILED: $path (HTTP $code — gated/private model; accept the license at $HF/$MODEL and pass a token via -t / \$HF_TOKEN)"
@@ -558,13 +573,24 @@ fetch_one() {
         printf 'FAIL\t0\t%s\n' "$path" >> "$RESULTS"
         return 1 ;;
     esac
-    if [[ $attempt -ge 3 ]]; then
-      warn "[$idx/$n_work] FAILED: $path (curl exit $rc, HTTP $code; have $(human "$got") of $(human "$size"))"
-      printf 'FAIL\t0\t%s\n' "$path" >> "$RESULTS"
-      return 1
+    # Self-healing: an abort that still moved bytes forward (curl exit 28 from
+    # the speed floor, or a dropped connection) is just a reconnect — resume
+    # immediately and don't count it. Give up only after 3 attempts that make
+    # NO progress at all.
+    if [[ $got -gt $pre ]]; then
+      stall=0
+      if [[ $rc -eq 28 && $QUIET -eq 0 ]]; then
+        info "[$idx/$n_work] ${C_DIM}slow connection (<$(human "$MIN_SPEED")/s) — reconnecting…${C_OFF}"
+      fi
+    else
+      stall=$((stall + 1))
+      if [[ $stall -ge 3 ]]; then
+        warn "[$idx/$n_work] FAILED: $path (curl exit $rc, HTTP $code; no progress after 3 attempts; have $(human "$got") of $(human "$size"))"
+        printf 'FAIL\t0\t%s\n' "$path" >> "$RESULTS"
+        return 1
+      fi
+      sleep 2
     fi
-    attempt=$((attempt + 1))
-    sleep 2
   done
 
   if [[ $VERIFY -eq 1 && $lfs != "-" ]]; then

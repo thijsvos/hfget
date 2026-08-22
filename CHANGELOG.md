@@ -4,6 +4,18 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and the project uses the
 `VERSION` string in the `hfget` script as the source of truth.
 
+## [2.5.0] — 2026-08-23
+
+### Added
+- **Self-healing transfers.** If a download stalls below `HFGET_MIN_SPEED`
+  bytes/sec (default 1 MB/s) for `HFGET_SPEED_TIME` seconds (default 30), curl
+  aborts and hfget reconnects, resuming from the `.part`. Previously the abort
+  floor was 1 KB/s, so a connection degraded to a fraction of the achievable
+  rate could crawl for hours without recovering.
+- The retry loop is now **progress-aware**: a reconnect that keeps moving bytes
+  forward is never counted as a failure; hfget only gives up after 3 attempts
+  that make no progress at all. Set `HFGET_MIN_SPEED=0` to disable (slow links).
+
 ## [2.4.0] — 2026-08-22
 
 ### Changed
