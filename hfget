@@ -347,7 +347,9 @@ done
 
 [[ -n $MODEL ]] || { usage >&2; exit 1; }
 jobs_re='^[0-9]+$'
-[[ $JOBS =~ $jobs_re ]] && [[ $JOBS -ge 1 && $JOBS -le 16 ]] || die "--jobs must be a number between 1 and 16"
+if ! [[ $JOBS =~ $jobs_re ]] || [[ $JOBS -lt 1 || $JOBS -gt 16 ]]; then
+  die "--jobs must be a number between 1 and 16"
+fi
 
 normalize_model_id "$MODEL"
 MODEL=$NORM_MODEL
@@ -358,7 +360,7 @@ if [[ -n $NORM_UREV && $REV == main ]]; then REV=$NORM_UREV; fi
 resolve_token
 setup_net
 
-# shellcheck disable=SC2329  # invoked via trap
+# shellcheck disable=SC2317,SC2329  # body runs via trap (not statically reachable)
 on_interrupt() {
   trap - INT TERM
   printf '\n' >&2
