@@ -6,6 +6,10 @@ Download HuggingFace models to any directory — a local disk, an external drive
 or a mounted NAS share — with a **built-in download queue**. One bash script,
 no Python, no build step. It just needs `curl` and `jq`.
 
+![hfget in action: download a model, see where it's stored, then queue more](demo.gif)
+
+...and for a whole set, queue them and watch the live progress:
+
 ```console
 $ hfget download Qwen/Qwen3-8B ~/models
 $ hfget add Qwen/Qwen3-8B mistralai/Mistral-7B-Instruct-v0.3   # queue several, walk away

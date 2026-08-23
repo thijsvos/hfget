@@ -7,6 +7,8 @@
 # local scratch / test output
 /scratch/
 /tmp/
+# demo recording sandbox (the committed demo.gif is kept; this is transient)
+/.demo/
 
 # OS cruft
 .DS_Store
