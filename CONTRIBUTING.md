@@ -1,7 +1,8 @@
 # Contributing to hfget
 
 Thanks for your interest! hfget is a single POSIX-friendly bash script, so
-contributing is deliberately low-ceremony.
+contributing is deliberately low-ceremony. By participating you agree to abide
+by the [Code of Conduct](CODE_OF_CONDUCT.md).
 
 ## Ground rules
 

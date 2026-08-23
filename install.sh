@@ -10,9 +10,14 @@
 set -eu
 
 REPO="thijsvos/hfget"
-RAW="https://raw.githubusercontent.com/$REPO/main/hfget"
 
 command -v curl >/dev/null 2>&1 || { echo "error: curl is required" >&2; exit 1; }
+
+# Install the latest tagged release; fall back to main if there is none / offline.
+TAG=$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null \
+      | grep '"tag_name"' | head -n 1 | sed -E 's/.*"tag_name" *: *"([^"]+)".*/\1/')
+REF="${TAG:-main}"
+RAW="https://raw.githubusercontent.com/$REPO/$REF/hfget"
 
 # Pick a destination: explicit DESTDIR > a writable /usr/local/bin > ~/.local/bin
 if [ -n "${DESTDIR:-}" ]; then
@@ -29,7 +34,7 @@ if [ -f "$(dirname "$0")/hfget" ]; then
   cp "$(dirname "$0")/hfget" "$DEST/hfget"
   echo "Installed hfget from local copy → $DEST/hfget"
 else
-  echo "Downloading hfget → $DEST/hfget ..."
+  echo "Downloading hfget ($REF) → $DEST/hfget ..."
   curl -fSL "$RAW" -o "$DEST/hfget"
 fi
 chmod +x "$DEST/hfget"

@@ -1,6 +1,8 @@
 # hfget
 
 [![CI](https://github.com/thijsvos/hfget/actions/workflows/ci.yml/badge.svg)](https://github.com/thijsvos/hfget/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-14b8a6.svg)](LICENSE)
+![Platform: macOS · Linux](https://img.shields.io/badge/platform-macOS%20%C2%B7%20Linux-555.svg)
 
 Download HuggingFace models to any directory — a local disk, an external drive,
 or a mounted NAS share — with a **built-in download queue**. One bash script,

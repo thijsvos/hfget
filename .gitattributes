@@ -1,0 +1,11 @@
+# Normalize line endings; a shell script must stay LF or the shebang breaks.
+* text=auto eol=lf
+hfget       text eol=lf
+install.sh  text eol=lf
+*.bats      text eol=lf
+*.tape      text eol=lf
+*.md        text eol=lf
+*.yml       text eol=lf
+
+# Binary assets — never touch.
+demo.gif    binary
