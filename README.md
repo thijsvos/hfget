@@ -54,11 +54,15 @@ Install jq if you don't have it: `sudo apt install jq` / `sudo dnf install jq` /
 
 ## Install
 
-One line (installs to `/usr/local/bin` or `~/.local/bin`):
+One line (installs the latest release to `/usr/local/bin` or `~/.local/bin`):
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/thijsvos/hfget/main/install.sh | sh
 ```
+
+As with any `curl | sh`, it's healthy to read what you run first — open
+[`install.sh`](install.sh) (it just downloads the latest release of the single
+`hfget` script), or use the clone-and-inspect path below.
 
 Or clone / copy the single file:
 

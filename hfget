@@ -17,7 +17,7 @@
 if [[ "${BASH_SOURCE[0]}" != "${0}" ]]; then HFGET_SOURCED=1; else HFGET_SOURCED=0; fi
 [[ $HFGET_SOURCED -eq 1 ]] || set -euo pipefail
 
-VERSION="2.6.0"
+VERSION="2.7.0"
 HF="https://huggingface.co"
 # State dir: explicit override > XDG state home > ~/.hfget
 if [[ -n ${HFGET_STATE_DIR:-} ]]; then QDIR=$HFGET_STATE_DIR
@@ -241,7 +241,7 @@ NEXT_URL=''
 api_get() {
   local url=$1 code msg=''
   code=$(curl -sS -H @"$HDRS" -D "$TMPD/rhdr" -o "$TMPD/body" -w '%{http_code}' \
-              --connect-timeout 15 --retry 2 "$url" </dev/null) \
+              --connect-timeout 15 --max-time 120 --retry 2 "$url" </dev/null) \
     || die "network error contacting huggingface.co (curl exit $?)"
   if [[ $code != 200 ]]; then
     # Strip control chars — the API error string is untrusted and printed to the TTY.
@@ -277,6 +277,12 @@ fetch_tree() {
     [[ $pages -lt 10000 ]] || die "too many pages listing $MODEL — aborting"
   done
   [[ -s $FILES_TSV ]] || die "no files found in $MODEL at revision '$REV'"
+  # Force the size column to a plain non-negative integer. jq's `numbers` still
+  # lets a malicious/broken repo send 1.5 or 1e30 (rendered "1E+30"), which
+  # breaks bash arithmetic mid-loop and would silently drop the rest of the file
+  # list. Clamp anything non-integer to 0 (real HF sizes are always integers).
+  awk -F'\t' 'BEGIN { OFS = "\t" } { if ($1 !~ /^[0-9]+$/) $1 = 0; print }' \
+    "$FILES_TSV" > "$FILES_TSV.tmp" && mv "$FILES_TSV.tmp" "$FILES_TSV"
   assert_safe_paths "$FILES_TSV"   # single choke point: reject unsafe paths at the source
 }
 
@@ -312,7 +318,7 @@ assert_safe_paths() {
 auth_probe_first() {
   local fp
   fp=$(head -n 1 "$1" | cut -f3-)
-  PROBE_CODE=$(curl -sIL -H @"$HDRS" -o /dev/null -w '%{http_code}' --connect-timeout 15 \
+  PROBE_CODE=$(curl -sIL -H @"$HDRS" -o /dev/null -w '%{http_code}' --connect-timeout 15 --max-time 60 \
                     "$HF/$MODEL/resolve/$REV_ENC/$(enc_path "$fp")" </dev/null) \
     || die "network error contacting huggingface.co (curl exit $?)"
 }
@@ -373,7 +379,9 @@ while [[ $# -gt 0 ]]; do
     -x|--exclude)   need_val "$@"; EXCLUDES+=("$2"); shift 2 ;;
     -l|--list)      LIST=1; shift ;;
     -n|--dry-run)   DRYRUN=1; shift ;;
-    -t|--token)     need_val "$@"; TOKEN=$2; shift 2 ;;
+    -t|--token)     need_val "$@"; TOKEN=$2
+                    warn "a token passed via -t is visible in 'ps' and shell history; prefer \$HF_TOKEN or the hf token file"
+                    shift 2 ;;
     -j|--jobs)      need_val "$@"; JOBS=$2; shift 2 ;;
     --verify)       VERIFY=1; shift ;;
     --require-mount) REQUIRE_MOUNT=1; shift ;;
@@ -487,7 +495,9 @@ while IFS=$'\t' read -r size lfs path; do
   printf '%s\t%s\t%s\t%s\n' "$n_work" "$size" "$lfs" "$path" >> "$WORK_TSV"
 done < "$SEL_TSV"
 
-avail_bytes=$(( $(df -Pk "$probe" | awk 'NR == 2 { print $4 }') * 1024 ))
+avail_kb=$(df -Pk "$probe" 2>/dev/null | awk 'NR == 2 { print $4 }')
+case "$avail_kb" in ''|*[!0-9]*) avail_kb=0 ;; esac   # 0 = unknown (df gave no usable number)
+avail_bytes=$(( avail_kb * 1024 ))
 
 info "model:        $MODEL @ $REV"
 info "destination:  $DEST"
@@ -510,7 +520,7 @@ case "$PROBE_CODE" in
   *)   warn "unexpected HTTP $PROBE_CODE probing the first file — attempting the download anyway" ;;
 esac
 
-if [[ $need_bytes -gt $avail_bytes ]]; then
+if [[ $avail_bytes -gt 0 && $need_bytes -gt $avail_bytes ]]; then
   die "not enough free space at the destination ($(human "$need_bytes") needed, $(human "$avail_bytes") available)"
 fi
 if [[ $DRYRUN -eq 1 ]]; then
@@ -536,6 +546,11 @@ Security → Files and Folders (or Full Disk Access), then restart the terminal.
 ${mkdir_err}${hint}"
 fi
 
+# Canonical destination root — fetch_one refuses to write anywhere that resolves
+# outside this, so a symlink pre-planted in a shared destination can't redirect
+# a write. Computed once, after DEST exists.
+DEST_REAL=$(cd "$DEST" && pwd -P)
+
 # ---------------------------------------------------------------- download --
 # When the queue runner set HFGET_PROG, log exact byte progress there so the
 # watcher can show a real percentage: T = total bytes this run must download,
@@ -551,9 +566,19 @@ QUIET=0; if [[ $JOBS -gt 1 || ! -t 2 ]]; then QUIET=1; fi
 
 fetch_one() {
   local idx=$1 size=$2 lfs=$3 path=$4
-  local out="$DEST/$path" part url have got rc code stall pre start_have sum
+  local out="$DEST/$path" part url have got rc code stall pre fstart start_have sum outdir
   part="$out.part"
   mkdir -p "$(dirname "$out")"
+
+  # Refuse to write through a symlink, or into a directory that resolves outside
+  # DEST — defends a shared/group-writable destination against a pre-planted
+  # symlink (file target truncation, or a directory-symlink escape).
+  outdir=$(cd "$(dirname "$out")" 2>/dev/null && pwd -P) || outdir=''
+  if [[ -z $outdir || ( $outdir != "$DEST_REAL" && $outdir != "$DEST_REAL"/* ) || -L $out || -L $part ]]; then
+    warn "[$idx/$n_work] FAILED: $path (destination resolves outside $DEST or is a symlink — refusing to write)"
+    printf 'FAIL\t0\t%s\n' "$path" >> "$RESULTS"
+    return 1
+  fi
 
   if [[ -f $out && $(filesize "$out") -eq $size ]]; then
     printf 'SKIP\t0\t%s\n' "$path" >> "$RESULTS"
@@ -582,7 +607,7 @@ fetch_one() {
   local maxfs=()
   if [[ $size -gt 0 ]]; then maxfs=(--max-filesize "$((size + 1048576))"); fi
 
-  stall=0
+  stall=0; fstart=$(date +%s)
   while :; do
     rc=0 code=200
     pre=$(filesize "$part")
@@ -600,6 +625,13 @@ fetch_one() {
     got=$(filesize "$part")
     if [[ $rc -eq 0 && $got -eq $size ]]; then break; fi
     if [[ $got -gt $size ]]; then : > "$part"; got=0; fi
+    # Hard per-file backstop: a server that dribbles just enough to look alive
+    # can't keep us here forever.
+    if [[ $(( $(date +%s) - fstart )) -gt 43200 ]]; then
+      warn "[$idx/$n_work] FAILED: $path (still incomplete after 12h — a stalling server?; have $(human "$got") of $(human "$size"))"
+      printf 'FAIL\t0\t%s\n' "$path" >> "$RESULTS"
+      return 1
+    fi
     case "$code" in
       401 | 403)
         warn "[$idx/$n_work] FAILED: $path (HTTP $code — gated/private model; accept the license at $HF/$MODEL and pass a token via -t / \$HF_TOKEN)"
@@ -614,7 +646,10 @@ fetch_one() {
     # the speed floor, or a dropped connection) is just a reconnect — resume
     # immediately and don't count it. Give up only after 3 attempts that make
     # NO progress at all.
-    if [[ $got -gt $pre ]]; then
+    # Reset the stall counter only on MEANINGFUL progress (>= 4 KB). A malicious
+    # server that trickles a byte or two per reconnect would otherwise reset it
+    # forever; require real forward movement.
+    if [[ $((got - pre)) -ge 4096 ]]; then
       stall=0
       if [[ $rc -eq 28 && $QUIET -eq 0 ]]; then
         info "[$idx/$n_work] ${C_DIM}slow connection (<$(human "$MIN_SPEED")/s) — reconnecting…${C_OFF}"
@@ -622,7 +657,7 @@ fetch_one() {
     else
       stall=$((stall + 1))
       if [[ $stall -ge 3 ]]; then
-        warn "[$idx/$n_work] FAILED: $path (curl exit $rc, HTTP $code; no progress after 3 attempts; have $(human "$got") of $(human "$size"))"
+        warn "[$idx/$n_work] FAILED: $path (curl exit $rc, HTTP $code; no meaningful progress after 3 attempts; have $(human "$got") of $(human "$size"))"
         printf 'FAIL\t0\t%s\n' "$path" >> "$RESULTS"
         return 1
       fi
@@ -771,7 +806,7 @@ foreign_hfget_pids() {
   local name
   name=$(basename "$SELF")
   ps -axww -o pid,ppid,command | awk -v me="$$" -v child="${RUN_CHILD:-0}" -v name="$name" '
-    index($0, name " download") == 0 { next }
+    $0 !~ ("(^|[ /])" name " download([ ]|$)") { next }
     /awk|grep/ { next }
     { pid = $1; ppid = $2 }
     pid == me || ppid == me { next }
@@ -809,6 +844,7 @@ cmd_add() {
     if [[ $parsing_models -eq 1 && $a != -* && $a != /* && $a != .* ]]; then
       normalize_model_id "$a"
       if [[ $NORM_MODEL =~ $MODEL_ID_RE ]]; then
+        case "$NORM_UREV" in *$'\t'* | *$'\n'*) die "revision may not contain tabs or newlines: '$NORM_UREV'" ;; esac
         models+=("$NORM_MODEL"); mrevs+=("$NORM_UREV")
         continue
       fi
@@ -867,7 +903,10 @@ cmd_add() {
   fi
   local fsp=$base
   while [[ ! -d $fsp && $fsp != / && $fsp != . ]]; do fsp=$(dirname "$fsp"); done
-  info "destination:  $base ($(human $(( $(df -Pk "$fsp" | awk 'NR == 2 { print $4 }') * 1024 ))) free)"
+  local free_kb
+  free_kb=$(df -Pk "$fsp" 2>/dev/null | awk 'NR == 2 { print $4 }')
+  case "$free_kb" in ''|*[!0-9]*) free_kb=0 ;; esac
+  info "destination:  $base ($(human $(( free_kb * 1024 ))) free)"
 
   resolve_token
   setup_net

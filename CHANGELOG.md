@@ -4,6 +4,34 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and the project uses the
 `VERSION` string in the `hfget` script as the source of truth.
 
+## [2.7.0] — 2026-08-23
+
+Second security pass — a three-lens independent audit of the now-public repo.
+
+### Security
+- **Symlink write guard.** `fetch_one` now refuses to write through a symlink,
+  or into any directory that resolves outside the chosen destination — so a
+  pre-planted symlink in a shared/group-writable download dir can't redirect a
+  write (file-target truncation or a directory-symlink escape). (HIGH)
+- **Robust size handling.** The API size column is clamped to a plain integer at
+  the source; previously a malicious repo could send `1.5`/`1e30`, break bash
+  arithmetic mid-loop, and silently drop the rest of the file list. (MEDIUM)
+- **Metadata timeouts.** The tree/probe requests gained `--max-time`, so a
+  slow-loris response can no longer hang `download`/`add` indefinitely. (MEDIUM)
+- **Retry loop can't be pinned forever.** The self-heal loop now resets only on
+  ≥4 KB of real progress and has a 12-hour per-file backstop, so a server that
+  dribbles a byte per reconnect can't keep a download alive endlessly. (MEDIUM)
+- A token passed via `-t` now warns that it's visible in `ps`/history (prefer
+  `$HF_TOKEN`); URL-embedded revisions are tab/newline-validated before queueing.
+
+### Changed
+- CI hardened: least-privilege `permissions: contents: read`, and
+  `actions/checkout` pinned to a commit SHA (kept current by Dependabot).
+- `df` free-space reads are guarded against non-numeric output (no more opaque
+  arithmetic abort if `df` returns nothing); the space check is skipped when
+  free space is unknown.
+- `README` notes that the `curl | sh` installer can be reviewed first.
+
 ## [2.6.0] — 2026-08-23
 
 Security hardening pass ahead of a public release (independent audit + fixes).
