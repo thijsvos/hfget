@@ -31,6 +31,10 @@ pending:
 - **A real queue** — enqueue N models; a background runner downloads them one at
   a time and picks up anything you add mid-run. Watch a live progress bar with
   percent, bytes and ETA (`hfget queue`).
+- **Smart updates** — `hfget update` re-fetches only the files that actually
+  changed upstream (compared by content hash, not just size), leaves unchanged
+  multi-GB weights in place, and cleans up files removed upstream. `hfget
+  outdated` shows which of your saved models have a new version.
 - **Resumable & verifiable** — interrupted downloads resume at the byte offset;
   `--verify` sha256-checks large files against HuggingFace's published hashes.
 - **No surprises** — before downloading it shows a size + contents breakdown and
@@ -121,6 +125,48 @@ hfget add Qwen/Qwen3-8B --verify
 Everything is resumable: kill the runner, reboot, or `hfget stop` — rerunning
 picks up where it left off. State lives in `~/.hfget/` (or `$XDG_STATE_HOME/hfget`).
 
+## Keeping models up to date
+
+Model authors push new revisions — retrained weights, a fixed tokenizer, added
+or removed files. `hfget update` refreshes a local copy the smart way: it diffs
+the repo against what you already have and **re-downloads only what changed**,
+leaving untouched multi-GB weights exactly where they are (no delete-and-replace).
+
+```sh
+hfget update Qwen/Qwen3-8B ~/models     # re-fetch only changed/new files
+hfget update --all ~/models             # refresh every saved model in one pass
+hfget outdated ~/models                 # just report which have updates
+```
+
+Each download records a tiny manifest inside the model folder
+(`.hfget/manifest.tsv`) with the content hash and revision of every file. An
+update compares that against the repo's current hashes, so even a file whose
+**size didn't change** but whose contents did is caught — and nothing is re-read
+off your disk (or NAS) to find out. The manifest travels with the data, so a
+second machine reading the same share gets exact, cheap updates too.
+
+Files **removed upstream** are listed and, once you confirm, deleted — only files
+hfget itself recorded downloading, never anything you added. Change the default:
+
+| Flag | What happens to files removed upstream |
+|---|---|
+| *(default)* | list them and ask; they're kept unless you say yes |
+| `--prune` | remove them without asking |
+| `--keep` | never remove — only add and replace |
+| `--backup` | move them to `<dest>/.hfget-old/<date>/` instead of deleting |
+
+**Partial downloads stay partial.** If you only kept one file of a repo — most
+often a single GGUF quant out of many — hfget remembers the `-i`/`-x` filter you
+downloaded with and re-applies it on every `update` (and `update --all`), so it
+never balloons into the whole repo. Pass `-i`/`-x` again only when you want to
+*change* what you keep.
+
+Other options mirror `download` (`-r`, `-i`/`-x`, `-t`, `-j`, `--verify`).
+`--rehash` hashes local files to detect same-size changes exactly on the first
+update of a folder that predates manifests. Set `HFGET_NO_MANIFEST=1` to skip
+writing the manifest (updates then fall back to size-only comparison, and
+pruning is disabled for safety).
+
 ## Why hfget?
 
 The official `hf` CLI and other downloaders work well, but hfget fills a
@@ -133,6 +179,7 @@ specific niche:
 | Live progress + ETA | ✅ | partial | ✅ | ✅ |
 | Straight to any dir, no cache | ✅ | needs flags | ✅ | ✅ |
 | Size/quant confirmation | ✅ | — | — | partial |
+| Incremental update + prune | ✅ | partial | — | — |
 | Resumable | ✅ | ✅ | ✅ | ✅ |
 
 If you want to line up a dozen models and let them trickle onto a NAS or big
@@ -162,6 +209,7 @@ shows up in `ps`.
 | `HFGET_QUEUE_NOSTART` | `add` never auto-starts the background runner |
 | `HFGET_QUEUE_NOWAIT` | the runner doesn't wait for a manual download in progress |
 | `HFGET_NOCAFFEINE` | don't keep the machine awake (macOS) |
+| `HFGET_NO_MANIFEST` | don't write the per-model `.hfget/manifest.tsv` (update/outdated fall back to size-only) |
 
 ## Troubleshooting
 

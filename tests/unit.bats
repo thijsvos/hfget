@@ -91,3 +91,107 @@ setup() {
   [ "$(filesize "$tmp")" = "5" ]
   rm -f "$tmp"
 }
+
+# ---------------------------------------------------------------- update ----
+
+@test "build_tree4 joins sizes with git/lfs oids by path" {
+  TMPD="$(mktemp -d)"
+  FILES_TSV="$TMPD/files"; OIDS_TSV="$TMPD/oids"
+  printf '100\tshaA\tfileA\n' >  "$FILES_TSV"
+  printf '5\t-\tfileB\n'      >> "$FILES_TSV"
+  printf 'fileA\tgitA\tshaA\n' >  "$OIDS_TSV"
+  printf 'fileB\tgitB\t-\n'    >> "$OIDS_TSV"
+  build_tree4
+  grep -q $'^fileA\t100\tshaA\tgitA$' "$TREE4"
+  grep -q $'^fileB\t5\t-\tgitB$' "$TREE4"
+  rm -rf "$TMPD"
+}
+
+@test "classify_diff: unchanged / changed (incl. same size) / new / stale" {
+  TMPD="$(mktemp -d)"
+  TREE4="$TMPD/tree4"
+  printf 'a\t100\tsha_a\t-\n'  >  "$TREE4"   # unchanged
+  printf 'b\t10\t-\tgitb2\n'   >> "$TREE4"   # changed (git oid differs)
+  printf 'c\t200\tsha_c2\t-\n' >> "$TREE4"   # changed: SAME size, different sha
+  printf 'e\t50\tsha_e\t-\n'   >> "$TREE4"   # new
+  m="$TMPD/m"
+  printf 'a\t100\tsha_a\t-\n'  >  "$m"
+  printf 'b\t10\t-\tgitb1\n'   >> "$m"
+  printf 'c\t200\tsha_c1\t-\n' >> "$m"
+  printf 'd\t5\t-\tgitd\n'     >> "$m"       # stale (gone from tree)
+  classify_diff 1 "$m"
+  [ "$(cut -f1 "$CLS_UNCH"    | sort | tr '\n' ' ')" = "a " ]
+  [ "$(cut -f1 "$CLS_CHANGED" | sort | tr '\n' ' ')" = "b c " ]
+  [ "$(cut -f1 "$CLS_NEW"     | sort | tr '\n' ' ')" = "e " ]
+  [ "$(cut -f1 "$CLS_STALE"   | sort | tr '\n' ' ')" = "d " ]
+  rm -rf "$TMPD"
+}
+
+@test "classify_diff falls back to on-disk size when there is no manifest" {
+  TMPD="$(mktemp -d)"; DEST="$TMPD/dest"; mkdir -p "$DEST"
+  printf 'AAAA' > "$DEST/have"                 # 4 bytes present
+  TREE4="$TMPD/tree4"
+  printf 'have\t4\tsha_h\t-\n'    >  "$TREE4"   # present at full size -> unchanged
+  printf 'missing\t9\tsha_m\t-\n' >> "$TREE4"   # absent -> new
+  : > "$TMPD/empty"
+  classify_diff 0 "$TMPD/empty"
+  [ "$(cut -f1 "$CLS_UNCH")" = "have" ]
+  [ "$(cut -f1 "$CLS_NEW")" = "missing" ]
+  [ ! -s "$CLS_STALE" ]
+  rm -rf "$TMPD"
+}
+
+@test "write_manifest + read round-trip, header parse, and kept-stale extras" {
+  TMPD="$(mktemp -d)"; DEST="$TMPD/dest"; mkdir -p "$DEST"
+  DEST_REAL="$(cd "$DEST" && pwd -P)"; REV=main; REPO_COMMIT=abc123
+  printf 'AAAA' > "$DEST/f1"
+  printf 'BB'   > "$DEST/f2"
+  printf 'S'    > "$DEST/stale1"
+  TREE4="$TMPD/tree4"
+  printf 'f1\t4\tsha1\t-\n' >  "$TREE4"
+  printf 'f2\t2\t-\tgit2\n' >> "$TREE4"
+  extra="$TMPD/extra"; printf 'stale1\t1\t-\tgits\n' > "$extra"
+  write_manifest "$extra"
+  [ -f "$DEST/.hfget/manifest.tsv" ]
+  read_manifest_header "$DEST"
+  [ "$MANIFEST_REV" = "main" ]
+  [ "$MANIFEST_COMMIT" = "abc123" ]
+  rows="$(read_manifest_rows "$DEST")"
+  printf '%s\n' "$rows" | grep -q $'^f1\t4\tsha1\t-$'
+  printf '%s\n' "$rows" | grep -q '^stale1'   # kept-stale extra is preserved
+  rm -rf "$TMPD"
+}
+
+@test "filter_cls keeps only paths matching includes/excludes" {
+  TMPD="$(mktemp -d)"
+  f="$TMPD/cls"
+  printf 'a.gguf\t1\t-\t-\n' >  "$f"
+  printf 'b.txt\t1\t-\t-\n'  >> "$f"
+  INCLUDES=('*.gguf'); EXCLUDES=()
+  filter_cls "$f"
+  [ "$(cut -f1 "$f" | tr '\n' ' ')" = "a.gguf " ]
+  rm -rf "$TMPD"
+}
+
+@test "manifest records and reads back the download filter" {
+  TMPD="$(mktemp -d)"; DEST="$TMPD/dest"; mkdir -p "$DEST"
+  DEST_REAL="$(cd "$DEST" && pwd -P)"; REV=main; REPO_COMMIT=xyz
+  printf 'AAAA' > "$DEST/keep.gguf"
+  TREE4="$TMPD/tree4"; printf 'keep.gguf\t4\tsha\t-\n' > "$TREE4"
+  INCLUDES=('*Q8_0*'); EXCLUDES=('*foo*')
+  write_manifest
+  INCLUDES=(); EXCLUDES=()
+  read_manifest_header "$DEST"
+  [ "${MANIFEST_INCLUDES[*]}" = "*Q8_0*" ]
+  [ "${MANIFEST_EXCLUDES[*]}" = "*foo*" ]
+  rm -rf "$TMPD"
+}
+
+@test "discover_models finds org/model dirs carrying a manifest" {
+  base="$(mktemp -d)"
+  mkdir -p "$base/orgA/modelX/.hfget" "$base/orgB/modelY/.hfget" "$base/orgC/plain"
+  : > "$base/orgA/modelX/.hfget/manifest.tsv"
+  : > "$base/orgB/modelY/.hfget/manifest.tsv"
+  [ "$(discover_models "$base" | sort | tr '\n' ' ')" = "orgA/modelX orgB/modelY " ]
+  rm -rf "$base"
+}

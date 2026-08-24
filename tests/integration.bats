@@ -66,3 +66,59 @@ teardown() {
   [ "$status" -eq 0 ]
   [ -f "$DEST/$TINY/config.json" ]
 }
+
+# ---------------------------------------------------------------- update ----
+
+@test "download seeds a manifest, and update reports up to date" {
+  "$HFGET" download "$TINY" "$DEST" -y
+  [ -f "$DEST/$TINY/.hfget/manifest.tsv" ]
+  grep -q 'commit=[0-9a-f]' "$DEST/$TINY/.hfget/manifest.tsv"
+  run "$HFGET" update "$TINY" "$DEST"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"up to date"* ]]
+}
+
+@test "update re-fetches only a changed file and leaves the rest untouched" {
+  "$HFGET" download "$TINY" "$DEST" -y
+  mf="$DEST/$TINY/.hfget/manifest.tsv"
+  before="$(stat -f %m "$DEST/$TINY/config.json" 2>/dev/null || stat -c %Y "$DEST/$TINY/config.json")"
+  # tamper the recorded hash for one LFS file so it looks changed upstream
+  awk -F'\t' 'BEGIN{OFS="\t"} $1=="pytorch_model.bin"{$3="deadbeef"} {print}' "$mf" > "$mf.t" && mv "$mf.t" "$mf"
+  run "$HFGET" update "$TINY" "$DEST" -y
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"changed:       1"* ]]
+  after="$(stat -f %m "$DEST/$TINY/config.json" 2>/dev/null || stat -c %Y "$DEST/$TINY/config.json")"
+  [ "$before" = "$after" ]        # unrelated file not rewritten
+}
+
+@test "stale file: default keeps it, --prune removes it" {
+  "$HFGET" download "$TINY" "$DEST" -y
+  mf="$DEST/$TINY/.hfget/manifest.tsv"
+  printf 'STALE' > "$DEST/$TINY/removed_upstream.bin"
+  printf 'removed_upstream.bin\t5\t-\tdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef\n' >> "$mf"
+  # non-interactive default is No -> kept
+  "$HFGET" update "$TINY" "$DEST"
+  [ -f "$DEST/$TINY/removed_upstream.bin" ]
+  # --prune removes it
+  "$HFGET" update "$TINY" "$DEST" --prune
+  [ ! -f "$DEST/$TINY/removed_upstream.bin" ]
+}
+
+@test "update --dry-run does not write a manifest" {
+  "$HFGET" download "$TINY" "$DEST" -y
+  rm -rf "$DEST/$TINY/.hfget"
+  run "$HFGET" update "$TINY" "$DEST" --dry-run
+  [ "$status" -eq 0 ]
+  [ ! -d "$DEST/$TINY/.hfget" ]     # dry-run must change nothing on disk
+}
+
+@test "outdated reports up to date, and flags a tampered commit" {
+  "$HFGET" download "$TINY" "$DEST" -y
+  run "$HFGET" outdated "$DEST"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"up to date"* ]]
+  mf="$DEST/$TINY/.hfget/manifest.tsv"
+  sed 's/commit=[0-9a-f]*/commit=0000000000000000000000000000000000000000/' "$mf" > "$mf.t" && mv "$mf.t" "$mf"
+  run "$HFGET" outdated "$DEST"
+  [[ "$output" == *"update available"* ]]
+}
