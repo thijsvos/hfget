@@ -1666,7 +1666,9 @@ update_one() {
 
   if [[ $n_work -eq 0 && $n_ren -eq 0 && $n_stale -eq 0 ]]; then
     info "${C_GRN}up to date${C_OFF}${REPO_COMMIT:+ (commit ${REPO_COMMIT:0:12})}"
-    if [[ -n $DEST_REAL ]]; then build_tree4; write_manifest; fi
+    # Refresh the manifest (records/updates the revision) — but never under
+    # --dry-run, which must change nothing on disk.
+    if [[ $DRYRUN -eq 0 && -n $DEST_REAL ]]; then build_tree4; write_manifest; fi
     return 0
   fi
 

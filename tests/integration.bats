@@ -104,6 +104,14 @@ teardown() {
   [ ! -f "$DEST/$TINY/removed_upstream.bin" ]
 }
 
+@test "update --dry-run does not write a manifest" {
+  "$HFGET" download "$TINY" "$DEST" -y
+  rm -rf "$DEST/$TINY/.hfget"
+  run "$HFGET" update "$TINY" "$DEST" --dry-run
+  [ "$status" -eq 0 ]
+  [ ! -d "$DEST/$TINY/.hfget" ]     # dry-run must change nothing on disk
+}
+
 @test "outdated reports up to date, and flags a tampered commit" {
   "$HFGET" download "$TINY" "$DEST" -y
   run "$HFGET" outdated "$DEST"
