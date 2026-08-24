@@ -195,3 +195,34 @@ setup() {
   [ "$(discover_models "$base" | sort | tr '\n' ' ')" = "orgA/modelX orgB/modelY " ]
   rm -rf "$base"
 }
+
+# ------------------------------------------------------------ queue ops -----
+
+# Point the queue-state globals at a throwaway dir so these never touch ~/.hfget.
+_use_temp_queue() {
+  QDIR="$1"; QF="$1/queue.tsv"; CF="$1/current.tsv"; FF="$1/failed.tsv"
+  DL="$1/done.log"; RL="$1/runner.log"; RP="$1/runner.pid"; SF="$1/stop"
+  CLP="$1/current.logpath"; LOCKD="$1/lock"
+}
+
+@test "clear --failed dismisses failed entries but leaves pending" {
+  d="$(mktemp -d)"; _use_temp_queue "$d"
+  printf 'org/pending\t2026-01-01T00:00:00Z\t/dest\n' > "$QF"
+  printf 'org/dead\t2026-01-01T00:00:00Z\t/dest\n'    > "$FF"
+  cmd_clear --failed
+  [ ! -s "$FF" ]        # failed cleared
+  [ -s "$QF" ]          # pending untouched
+  rm -rf "$d"
+}
+
+@test "rm <model> removes the model from both pending and failed" {
+  d="$(mktemp -d)"; _use_temp_queue "$d"
+  printf 'org/keep\t2026-01-01T00:00:00Z\t/dest\n'  > "$QF"
+  printf 'org/dead\t2026-01-01T00:00:00Z\t/dest\n' >> "$QF"
+  printf 'org/dead\t2026-01-01T00:00:00Z\t/dest\n'  > "$FF"
+  cmd_rm org/dead
+  grep -q '^org/keep' "$QF"
+  ! grep -q '^org/dead' "$QF"
+  [ ! -s "$FF" ]        # the failed copy is dismissed too
+  rm -rf "$d"
+}

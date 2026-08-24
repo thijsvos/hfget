@@ -17,7 +17,7 @@
 if [[ "${BASH_SOURCE[0]}" != "${0}" ]]; then HFGET_SOURCED=1; else HFGET_SOURCED=0; fi
 [[ $HFGET_SOURCED -eq 1 ]] || set -euo pipefail
 
-VERSION="2.8.0"
+VERSION="2.8.1"
 HF="https://huggingface.co"
 # State dir: explicit override > XDG state home > ~/.hfget
 if [[ -n ${HFGET_STATE_DIR:-} ]]; then QDIR=$HFGET_STATE_DIR
@@ -90,9 +90,12 @@ Queue (state in ~/.hfget):
                        pending and failed entries; refreshes every SEC seconds
                        (default: 1) until Ctrl-C
   hfget status         the same view as a one-shot snapshot
-  hfget rm <n|model>   remove a pending entry (number from 'hfget queue')
-  hfget clear [--all]  remove all pending entries; --all wipes the whole queue
-                       (pending + failed + current) and stops the runner
+  hfget rm <n|model>   remove a pending entry by number, or remove a model from
+                       BOTH pending and failed by id (dismisses a dead entry)
+  hfget clear [--all|--failed]
+                       remove pending entries; --failed dismisses failed entries
+                       only; --all wipes the whole queue (pending + failed +
+                       current) and stops the runner
   hfget retry          re-queue all failed entries
   hfget stop [--now]   stop after the current model, or immediately (--now);
                        everything is resumable
@@ -1151,7 +1154,7 @@ render_status() {
   local nf
   nf=$(grep -c . "$FF" 2>/dev/null || true)
   if [[ ${nf:-0} -gt 0 ]]; then
-    echo "failed:  $nf entr$( [[ $nf -eq 1 ]] && echo y || echo ies ) — re-queue with: hfget retry"
+    echo "failed:  $nf entr$( [[ $nf -eq 1 ]] && echo y || echo ies ) — retry: hfget retry · dismiss: hfget clear --failed"
     cut -f1 "$FF" | sed 's/^/  ✗ /'
   fi
   local nd
@@ -1184,28 +1187,48 @@ cmd_queue() {
 cmd_rm() {
   q_init
   [[ $# -ge 1 ]] || die "usage: hfget rm <number|model>"
-  local target=$1 before after
+  local target=$1 before after fbefore fafter removed
   q_lock
   before=$(grep -c . "$QF" || true)
+  fbefore=$(grep -c . "$FF" || true)
+  fafter=$fbefore
   if [[ $target =~ ^[0-9]+$ ]]; then
     awk -v n="$target" 'NR != n' "$QF" > "$QF.tmp" && mv "$QF.tmp" "$QF"
   else
+    # By model id, remove from both pending AND failed (so a dead failed entry
+    # can be dismissed with the same command, not just re-queued).
     normalize_model_id "$target"
     awk -F '\t' -v m="$NORM_MODEL" '$1 != m' "$QF" > "$QF.tmp" && mv "$QF.tmp" "$QF"
+    awk -F '\t' -v m="$NORM_MODEL" '$1 != m' "$FF" > "$FF.tmp" && mv "$FF.tmp" "$FF"
+    fafter=$(grep -c . "$FF" || true)
   fi
   after=$(grep -c . "$QF" || true)
   q_unlock
-  if [[ ${before:-0} -eq ${after:-0} ]]; then
-    warn "no pending entry matched '$target' (see: hfget queue)"
+  removed=$(( (before - after) + (fbefore - fafter) ))
+  if [[ $removed -eq 0 ]]; then
+    warn "no pending or failed entry matched '$target' (see: hfget queue)"
   else
-    info "removed $((before - after)) entr$( [[ $((before - after)) -eq 1 ]] && echo y || echo ies )"
+    info "removed $removed entr$( [[ $removed -eq 1 ]] && echo y || echo ies )"
   fi
 }
 
 cmd_clear() {
   q_init
-  local all=0 n nf stopped=0 i
-  if [[ ${1:-} == --all || ${1:-} == -a ]]; then all=1; fi
+  local all=0 failed_only=0 n nf stopped=0 i
+  case "${1:-}" in
+    --all|-a)     all=1 ;;
+    --failed|-f)  failed_only=1 ;;
+  esac
+
+  # Dismiss failed entries only — leave pending and the runner alone.
+  if [[ $failed_only -eq 1 ]]; then
+    q_lock
+    nf=$(grep -c . "$FF" || true)
+    : > "$FF"
+    q_unlock
+    info "cleared ${nf:-0} failed entr$( [[ ${nf:-0} -eq 1 ]] && echo y || echo ies )"
+    return 0
+  fi
 
   if [[ $all -eq 1 ]]; then
     # Stop an active runner first; its trap re-queues the current entry,
@@ -1239,7 +1262,7 @@ cmd_clear() {
     info "cleared ${n:-0} pending entr$( [[ ${n:-0} -eq 1 ]] && echo y || echo ies )"
     nf=$(grep -c . "$FF" || true)
     if [[ ${nf:-0} -gt 0 ]]; then
-      info "${C_DIM}note: ${nf} failed entr$( [[ $nf -eq 1 ]] && echo y || echo ies ) kept — 'hfget clear --all' also removes those (and stops the runner)${C_OFF}"
+      info "${C_DIM}note: ${nf} failed entr$( [[ $nf -eq 1 ]] && echo y || echo ies ) kept — dismiss with 'hfget clear --failed' (or 'hfget retry' to re-run them)${C_OFF}"
     fi
   fi
 }
