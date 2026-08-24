@@ -4,6 +4,40 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and the project uses the
 `VERSION` string in the `hfget` script as the source of truth.
 
+## [2.8.0] — 2026-08-24
+
+Smart, incremental model updates.
+
+### Added
+- **`hfget update <model...>`** — refresh a local copy by re-downloading **only
+  the files that changed upstream**, leaving unchanged weights in place (no
+  delete-and-replace). Changes are detected by content hash, so a file whose
+  **size is unchanged but whose contents changed** is caught — without re-reading
+  the existing bytes off disk/NAS.
+- **In-folder manifest** (`<model>/.hfget/manifest.tsv`): every `download` and
+  `update` records each file's size, sha256/git-oid and the repo revision +
+  commit. It travels with the data, so a second machine reading the same share
+  gets exact, cheap updates too. Opt out with `HFGET_NO_MANIFEST=1`.
+- **Stale-file handling.** Files removed upstream are listed and, on
+  confirmation (default No), deleted — but only files hfget itself recorded, and
+  never through a symlink or outside the destination. `--prune` removes without
+  asking, `--keep` retains them, `--backup` moves them to `.hfget-old/<date>/`.
+- **Rename detection.** A file whose content matches one that moved upstream is
+  renamed locally instead of being re-downloaded.
+- **`hfget outdated [base-dir]`** — one cheap commit-sha check per managed model
+  to report which have upstream updates, with no downloads.
+- **`hfget update --all [base-dir]`** — update every managed model found under a
+  base dir in a single pass.
+- `--rehash` re-hashes local files to detect same-size changes exactly on the
+  first update of a folder that predates manifests.
+
+### Changed
+- The download engine (`fetch_one` + the work-list loop) is now shared by
+  `download` and `update`; downloads are unchanged. Changed files are re-fetched
+  to a fresh `.part` and swapped in atomically — the old copy is replaced only
+  after the new one is complete, and nothing is pruned until every download
+  succeeds.
+
 ## [2.7.0] — 2026-08-23
 
 Second security pass — a three-lens independent audit of the now-public repo.

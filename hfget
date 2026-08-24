@@ -17,7 +17,7 @@
 if [[ "${BASH_SOURCE[0]}" != "${0}" ]]; then HFGET_SOURCED=1; else HFGET_SOURCED=0; fi
 [[ $HFGET_SOURCED -eq 1 ]] || set -euo pipefail
 
-VERSION="2.7.0"
+VERSION="2.8.0"
 HF="https://huggingface.co"
 # State dir: explicit override > XDG state home > ~/.hfget
 if [[ -n ${HFGET_STATE_DIR:-} ]]; then QDIR=$HFGET_STATE_DIR
@@ -99,6 +99,23 @@ Queue (state in ~/.hfget):
   hfget run            process the queue in the foreground
   hfget log [model]    tail the current (or named model's) download log
 
+Keep models current (foreground):
+  hfget update <org/model...> [base-dir] [options]
+                       re-fetch only the files that changed upstream; unchanged
+                       weights are left in place (no delete-and-replace). Files
+                       removed upstream are listed and, with your confirmation,
+                       deleted. Mirrors 'download' options (-r/-i/-x/-t/-j
+                       /--verify), plus:
+      --all            update every managed model found under the base dir
+      --prune          remove stale files without asking
+      --keep           never remove stale files (only add/replace)
+      --backup         move stale files to <dest>/.hfget-old/<date>/ instead
+      --rehash         hash local files to catch same-size changes exactly
+                       (useful for the first update of a pre-manifest dir)
+  hfget outdated [base-dir]
+                       list which managed models under the base dir have an
+                       upstream update (one quick check each; no downloads)
+
 Other:
   -h, --help           this help
   -V, --version        print version
@@ -117,6 +134,8 @@ Environment:
                        (default 1048576 = 1 MB/s; set 0 to disable self-healing)
   HFGET_SPEED_TIME     seconds a stall must persist before reconnecting (default 30)
   HFGET_NOCAFFEINE     if set, do not re-exec under caffeinate (macOS)
+  HFGET_NO_MANIFEST    if set, do not write the per-model .hfget/manifest.tsv
+                       (disables the exact/cheap 'update' and 'outdated' checks)
 
 Examples:
   export HFGET_DEST="$HOME/models"                 # e.g. in ~/.zshrc / ~/.bashrc
@@ -124,6 +143,9 @@ Examples:
   hfget add Qwen/Qwen3-8B mistralai/Mistral-7B-Instruct-v0.3 --verify
   hfget add bartowski/Llama-3.3-70B-Instruct-GGUF -i '*Q4_K_M*'
   hfget queue
+  hfget update Qwen/Qwen3-8B                        # re-fetch only what changed
+  hfget outdated                                    # which models have updates?
+  hfget update --all                                # refresh the whole archive
 EOF
 }
 
@@ -267,15 +289,28 @@ api_get() {
 fetch_tree() {
   REV_ENC=$(jq -rn --arg r "$REV" '$r | @uri')
   FILES_TSV="$TMPD/files.tsv"; : > "$FILES_TSV"
+  # When WANT_OIDS=1 (update/manifest paths) also capture, per file, the git
+  # blob oid and lfs sha into OIDS_TSV, and the repo's commit sha from the
+  # response headers — none of which `download` needs by itself.
+  local want_oids=${WANT_OIDS:-0}
+  REPO_COMMIT=''
+  if [[ $want_oids -eq 1 ]]; then OIDS_TSV="$TMPD/oids.tsv"; : > "$OIDS_TSV"; fi
   local url="$HF/api/models/$MODEL/tree/$REV_ENC?recursive=true" pages=0
   while [[ -n $url ]]; do
     api_get "$url"
     jq -r '.[] | select(.type == "file") | [(.size | numbers // 0), (.lfs.oid // "-"), .path] | @tsv' \
       "$TMPD/body" >> "$FILES_TSV"
+    if [[ $want_oids -eq 1 ]]; then
+      jq -r '.[] | select(.type == "file") | [.path, (.oid // "-"), (.lfs.oid // "-")] | @tsv' \
+        "$TMPD/body" >> "$OIDS_TSV"
+    fi
     url=$NEXT_URL
     pages=$((pages + 1))
     [[ $pages -lt 10000 ]] || die "too many pages listing $MODEL — aborting"
   done
+  # Record the commit sha of this revision (the tree endpoint doesn't return the
+  # X-Repo-Commit header; the model-info endpoint carries it as .sha). Non-fatal.
+  if [[ $want_oids -eq 1 ]]; then REPO_COMMIT=$(current_commit "$MODEL" "$REV"); fi
   [[ -s $FILES_TSV ]] || die "no files found in $MODEL at revision '$REV'"
   # Force the size column to a plain non-negative integer. jq's `numbers` still
   # lets a malicious/broken repo send 1.5 or 1e30 (rendered "1E+30"), which
@@ -429,6 +464,7 @@ trap on_interrupt INT TERM
 
 # ------------------------------------------------------- file list & filters --
 info "${C_DIM}fetching file list: $MODEL @ $REV${C_OFF}"
+WANT_OIDS=1
 fetch_tree
 apply_filters
 [[ -s $SEL_TSV ]] || die "no files match the given --include/--exclude filters"
@@ -564,148 +600,12 @@ RESULTS="$TMPD/results"; : > "$RESULTS"
 # one clean line per completed file.
 QUIET=0; if [[ $JOBS -gt 1 || ! -t 2 ]]; then QUIET=1; fi
 
-fetch_one() {
-  local idx=$1 size=$2 lfs=$3 path=$4
-  local out="$DEST/$path" part url have got rc code stall pre fstart start_have sum outdir
-  part="$out.part"
-  mkdir -p "$(dirname "$out")"
-
-  # Refuse to write through a symlink, or into a directory that resolves outside
-  # DEST — defends a shared/group-writable destination against a pre-planted
-  # symlink (file target truncation, or a directory-symlink escape).
-  outdir=$(cd "$(dirname "$out")" 2>/dev/null && pwd -P) || outdir=''
-  if [[ -z $outdir || ( $outdir != "$DEST_REAL" && $outdir != "$DEST_REAL"/* ) || -L $out || -L $part ]]; then
-    warn "[$idx/$n_work] FAILED: $path (destination resolves outside $DEST or is a symlink — refusing to write)"
-    printf 'FAIL\t0\t%s\n' "$path" >> "$RESULTS"
-    return 1
-  fi
-
-  if [[ -f $out && $(filesize "$out") -eq $size ]]; then
-    printf 'SKIP\t0\t%s\n' "$path" >> "$RESULTS"
-    return 0
-  fi
-
-  url="$HF/$MODEL/resolve/$REV_ENC/$(enc_path "$path")"
-  if [[ ! -f $part ]]; then : > "$part"; fi
-  have=$(filesize "$part")
-  if [[ $have -gt $size ]]; then : > "$part"; have=0; fi
-  start_have=$have
-  if [[ -n ${PROGF:-} ]]; then printf 'C\t%s\t%s\t%s\n' "$size" "$start_have" "$path" >> "$PROGF"; fi
-
-  if [[ $QUIET -eq 0 ]]; then
-    if [[ $start_have -gt 0 ]]; then
-      info "[$idx/$n_work] $path ($(human "$size")) ${C_DIM}— resuming at $(human "$start_have")${C_OFF}"
-    else
-      info "[$idx/$n_work] $path ($(human "$size"))"
-    fi
-  elif [[ $start_have -gt 0 ]]; then
-    info "[$idx/$n_work] resuming $path at $(human "$start_have") of $(human "$size")"
-  fi
-
-  # Cap the transfer at the declared size (+1 MB slack) so a bogus oversized or
-  # length-less response can't fill the disk. Skipped for zero-length files.
-  local maxfs=()
-  if [[ $size -gt 0 ]]; then maxfs=(--max-filesize "$((size + 1048576))"); fi
-
-  stall=0; fstart=$(date +%s)
-  while :; do
-    rc=0 code=200
-    pre=$(filesize "$part")
-    if [[ $pre -lt $size ]]; then
-      if [[ $QUIET -eq 1 ]]; then
-        code=$(curl -fsSL -H @"$HDRS" ${maxfs[@]+"${maxfs[@]}"} --connect-timeout 15 --retry 2 --retry-delay 2 \
-                    --speed-limit "$MIN_SPEED" --speed-time "$SPEED_TIME" \
-                    -C - -o "$part" -w '%{http_code}' "$url" </dev/null) || rc=$?
-      else
-        code=$(curl -fSL --progress-bar -H @"$HDRS" ${maxfs[@]+"${maxfs[@]}"} --connect-timeout 15 --retry 2 --retry-delay 2 \
-                    --speed-limit "$MIN_SPEED" --speed-time "$SPEED_TIME" \
-                    -C - -o "$part" -w '%{http_code}' "$url" </dev/null) || rc=$?
-      fi
-    fi
-    got=$(filesize "$part")
-    if [[ $rc -eq 0 && $got -eq $size ]]; then break; fi
-    if [[ $got -gt $size ]]; then : > "$part"; got=0; fi
-    # Hard per-file backstop: a server that dribbles just enough to look alive
-    # can't keep us here forever.
-    if [[ $(( $(date +%s) - fstart )) -gt 43200 ]]; then
-      warn "[$idx/$n_work] FAILED: $path (still incomplete after 12h — a stalling server?; have $(human "$got") of $(human "$size"))"
-      printf 'FAIL\t0\t%s\n' "$path" >> "$RESULTS"
-      return 1
-    fi
-    case "$code" in
-      401 | 403)
-        warn "[$idx/$n_work] FAILED: $path (HTTP $code — gated/private model; accept the license at $HF/$MODEL and pass a token via -t / \$HF_TOKEN)"
-        printf 'FAIL\t0\t%s\n' "$path" >> "$RESULTS"
-        return 1 ;;
-      404)
-        warn "[$idx/$n_work] FAILED: $path (HTTP 404 — the file vanished from the repo?)"
-        printf 'FAIL\t0\t%s\n' "$path" >> "$RESULTS"
-        return 1 ;;
-    esac
-    # Self-healing: an abort that still moved bytes forward (curl exit 28 from
-    # the speed floor, or a dropped connection) is just a reconnect — resume
-    # immediately and don't count it. Give up only after 3 attempts that make
-    # NO progress at all.
-    # Reset the stall counter only on MEANINGFUL progress (>= 4 KB). A malicious
-    # server that trickles a byte or two per reconnect would otherwise reset it
-    # forever; require real forward movement.
-    if [[ $((got - pre)) -ge 4096 ]]; then
-      stall=0
-      if [[ $rc -eq 28 && $QUIET -eq 0 ]]; then
-        info "[$idx/$n_work] ${C_DIM}slow connection (<$(human "$MIN_SPEED")/s) — reconnecting…${C_OFF}"
-      fi
-    else
-      stall=$((stall + 1))
-      if [[ $stall -ge 3 ]]; then
-        warn "[$idx/$n_work] FAILED: $path (curl exit $rc, HTTP $code; no meaningful progress after 3 attempts; have $(human "$got") of $(human "$size"))"
-        printf 'FAIL\t0\t%s\n' "$path" >> "$RESULTS"
-        return 1
-      fi
-      sleep 2
-    fi
-  done
-
-  if [[ $VERIFY -eq 1 && $lfs != "-" ]]; then
-    sum=$(sha256 "$part" 2>/dev/null || echo '')
-    if [[ -z $sum ]]; then
-      warn "[$idx/$n_work] --verify: no sha256sum/shasum found — skipping checksum for $path"
-    elif [[ $sum != "$lfs" ]]; then
-      rm -f "$part"
-      warn "[$idx/$n_work] sha256 MISMATCH: $path — partial removed; rerun to re-download"
-      printf 'FAIL\t0\t%s\n' "$path" >> "$RESULTS"
-      return 1
-    fi
-  fi
-
-  if ! mv -f "$part" "$out"; then
-    warn "[$idx/$n_work] FAILED: $path (could not move into place at $DEST — check permissions/space)"
-    printf 'FAIL\t0\t%s\n' "$path" >> "$RESULTS"
-    return 1
-  fi
-  printf 'OK\t%s\t%s\n' "$((size - start_have))" "$path" >> "$RESULTS"
-  if [[ -n ${PROGF:-} ]]; then printf 'F\t%s\n' "$((size - start_have))" >> "$PROGF"; fi
-  if [[ $QUIET -eq 1 ]]; then
-    info "[$idx/$n_work] ${C_GRN}done${C_OFF} $path ($(human "$size"))"
-  elif [[ $VERIFY -eq 1 && $lfs != "-" ]]; then
-    info "[$idx/$n_work] ${C_GRN}sha256 ok${C_OFF}"
-  fi
-  return 0
-}
+# The download engine — fetch_one() and run_worklist() — lives at top level (in
+# the "shared download engine" section) so 'update' can reuse it.
 
 info ""
 SECONDS=0
-if [[ $JOBS -eq 1 ]]; then
-  while IFS=$'\t' read -r idx size lfs path; do
-    fetch_one "$idx" "$size" "$lfs" "$path" || true
-  done < "$WORK_TSV"
-else
-  info "${C_DIM}downloading with $JOBS parallel jobs${C_OFF}"
-  while IFS=$'\t' read -r idx size lfs path; do
-    while [[ $(jobs -pr | wc -l) -ge $JOBS ]]; do sleep 0.3; done
-    fetch_one "$idx" "$size" "$lfs" "$path" &
-  done < "$WORK_TSV"
-  wait
-fi
+run_worklist
 elapsed=$SECONDS
 
 # ----------------------------------------------------------------- summary --
@@ -731,6 +631,9 @@ info "${C_GRN}done:${C_OFF} $n_ok file(s) downloaded, $(human "$dl_bytes") in ${
 if [[ $((n_have + n_skip)) -gt 0 ]]; then
   info "      $((n_have + n_skip)) file(s) were already complete and skipped"
 fi
+# Seed/refresh the in-folder manifest so a later 'update'/'outdated' is exact
+# and cheap (skipped entirely when HFGET_NO_MANIFEST is set).
+{ build_tree4 && write_manifest; } || true
 info "      → $DEST"
 exit 0
 
@@ -1398,12 +1301,767 @@ cmd_log() {
   fi
 }
 
+# ===========================================================================
+#  update / outdated  — manifest + diff helpers
+# ===========================================================================
+# Every managed model carries a tiny manifest inside its own folder, recording
+# the files + content hashes + revision hfget last put there. It lets a later
+# 'update' diff exactly (catching same-size content changes) and prune safely
+# (only files hfget itself recorded), without re-reading gigabytes off the disk.
+MANIFEST_REL=".hfget/manifest.tsv"
+manifest_file() { printf '%s/%s' "$1" "$MANIFEST_REL"; }
+
+nrows() { awk 'END { print NR + 0 }' "$1" 2>/dev/null || echo 0; }
+bsum()  { awk -F '\t' '{ s += $2 } END { printf "%d", s + 0 }' "$1" 2>/dev/null || echo 0; }
+
+# Combine the current tree into TREE4 (path \t size \t lfs \t git-oid), sorted by
+# path. Needs FILES_TSV + OIDS_TSV from fetch_tree (WANT_OIDS=1). Non-zero if the
+# oid data is missing.
+build_tree4() {
+  [[ -n ${OIDS_TSV:-} && -f ${OIDS_TSV:-/nonexistent} ]] || return 1
+  TREE4="$TMPD/tree4.tsv"
+  awk -F '\t' 'BEGIN { OFS = "\t" } { print $3, $1, $2 }' "$FILES_TSV" \
+    | LC_ALL=C sort -t$'\t' -k1,1 > "$TMPD/f_by_path.tsv"
+  awk -F '\t' 'BEGIN { OFS = "\t" } { print $1, $2 }' "$OIDS_TSV" \
+    | LC_ALL=C sort -t$'\t' -k1,1 > "$TMPD/o_by_path.tsv"
+  LC_ALL=C join -t$'\t' -1 1 -2 1 -a 1 -e '-' -o '1.1,1.2,1.3,2.2' \
+    "$TMPD/f_by_path.tsv" "$TMPD/o_by_path.tsv" > "$TREE4"
+}
+
+# Emit a manifest's data rows (skips the '# ...' header). Non-zero if absent.
+read_manifest_rows() {
+  local mf; mf=$(manifest_file "$1")
+  [[ -f $mf ]] || return 1
+  grep -v '^#' "$mf" 2>/dev/null || true
+}
+
+# Parse a manifest's header into MANIFEST_REV / MANIFEST_COMMIT (empty if none).
+read_manifest_header() {
+  local mf hdr; mf=$(manifest_file "$1")
+  MANIFEST_REV=''; MANIFEST_COMMIT=''
+  [[ -f $mf ]] || return 1
+  hdr=$(grep -m1 '^#' "$mf" 2>/dev/null || true)
+  [[ -n $hdr ]] || return 1
+  MANIFEST_REV=$(printf '%s\n' "$hdr" | sed -n 's/.*[[:space:]]rev=\([^[:space:]]*\).*/\1/p')
+  MANIFEST_COMMIT=$(printf '%s\n' "$hdr" | sed -n 's/.*[[:space:]]commit=\([^[:space:]]*\).*/\1/p')
+  return 0
+}
+
+# Write/refresh $DEST's manifest from the current tree, listing only files that
+# are actually present on disk at full size. An optional extra-rows file ($1)
+# adds entries to preserve for files not in the tree but still on disk — i.e.
+# stale files the user chose to KEEP, so a later 'update' still knows hfget put
+# them there (stale paths are disjoint from tree paths, so no dedup is needed).
+# Atomic; never writes outside DEST_REAL; skipped when HFGET_NO_MANIFEST is set.
+write_manifest() {
+  local extra=${1:-}
+  [[ -z ${HFGET_NO_MANIFEST:-} ]] || return 0
+  [[ -n ${TREE4:-} && -f ${TREE4:-/nonexistent} ]] || return 0
+  local mdir="$DEST/.hfget" mf mtmp ts real path size lfs git out
+  real=$(cd "$DEST" 2>/dev/null && pwd -P) || return 0
+  [[ $real == "$DEST_REAL" ]] || return 0
+  mkdir -p "$mdir" 2>/dev/null || return 0
+  chmod 700 "$mdir" 2>/dev/null || true
+  mf="$mdir/manifest.tsv"; mtmp="$mf.tmp.$$"
+  ts=$(date -u +%FT%TZ)
+  {
+    printf '# hfget %s rev=%s commit=%s updated=%s\n' "$VERSION" "$REV" "${REPO_COMMIT:-}" "$ts"
+    while IFS=$'\t' read -r path size lfs git; do
+      out="$DEST/$path"
+      [[ -f $out && $(filesize "$out") -eq $size ]] || continue
+      printf '%s\t%s\t%s\t%s\n' "$path" "$size" "$lfs" "$git"
+    done < "$TREE4"
+    if [[ -n $extra && -f $extra ]]; then
+      while IFS=$'\t' read -r path size lfs git; do
+        [[ -f "$DEST/$path" ]] || continue
+        printf '%s\t%s\t%s\t%s\n' "$path" "$size" "$lfs" "$git"
+      done < "$extra"
+    fi
+  } > "$mtmp" || { rm -f "$mtmp" 2>/dev/null || true; return 0; }
+  mv -f "$mtmp" "$mf" 2>/dev/null || rm -f "$mtmp" 2>/dev/null || true
+  return 0
+}
+
+# Classify TREE4 against a manifest-rows file. have_manifest=1 uses the recorded
+# content ids (exact, incl. same-size changes); otherwise falls back to on-disk
+# size. Writes CLS_CHANGED / CLS_NEW / CLS_UNCH / CLS_STALE, each row
+# "path \t size \t lfs \t git".
+classify_diff() {
+  local have_manifest=$1 mrows=$2
+  CLS_CHANGED="$TMPD/cls_changed"; CLS_NEW="$TMPD/cls_new"
+  CLS_UNCH="$TMPD/cls_unch"; CLS_STALE="$TMPD/cls_stale"
+  : > "$CLS_CHANGED"; : > "$CLS_NEW"; : > "$CLS_UNCH"; : > "$CLS_STALE"
+  if [[ $have_manifest -eq 1 && -s $mrows ]]; then
+    awk -F '\t' -v chg="$CLS_CHANGED" -v nw="$CLS_NEW" -v un="$CLS_UNCH" -v st="$CLS_STALE" '
+      function id(lfs, git) { return (lfs != "-" && lfs != "") ? lfs : git }
+      FNR == NR { mp[$1] = 1; ms[$1] = $2; ml[$1] = $3; mg[$1] = $4; mid[$1] = id($3, $4); next }
+      {
+        seen[$1] = 1
+        if (!($1 in mp))          { print $1 "\t" $2 "\t" $3 "\t" $4 > nw; next }
+        if (id($3, $4) == mid[$1])  print $1 "\t" $2 "\t" $3 "\t" $4 > un
+        else                        print $1 "\t" $2 "\t" $3 "\t" $4 > chg
+      }
+      END { for (p in mp) if (!(p in seen)) print p "\t" ms[p] "\t" ml[p] "\t" mg[p] > st }
+    ' "$mrows" "$TREE4"
+  else
+    local path size lfs git out
+    while IFS=$'\t' read -r path size lfs git; do
+      out="$DEST/$path"
+      if [[ -f $out && $(filesize "$out") -eq $size ]]; then
+        printf '%s\t%s\t%s\t%s\n' "$path" "$size" "$lfs" "$git" >> "$CLS_UNCH"
+      else
+        printf '%s\t%s\t%s\t%s\n' "$path" "$size" "$lfs" "$git" >> "$CLS_NEW"
+      fi
+    done < "$TREE4"
+  fi
+}
+
+# --rehash: synthesize manifest rows from the bytes on disk so a first update
+# (no manifest) can still detect a same-size content change. LFS files are
+# hashed (sha256) and compared to the tree; non-LFS files are assumed unchanged
+# when present at full size (their git-blob oid isn't cheap to recompute here).
+synth_manifest_by_hash() {
+  local path size lfs git out sum
+  while IFS=$'\t' read -r path size lfs git; do
+    out="$DEST/$path"
+    [[ -f $out && $(filesize "$out") -eq $size ]] || continue
+    if [[ $lfs != "-" ]]; then
+      sum=$(sha256 "$out" 2>/dev/null || echo '')
+      [[ -n $sum ]] || sum=$lfs
+      printf '%s\t%s\t%s\t%s\n' "$path" "$size" "$sum" "-"
+    else
+      printf '%s\t%s\t%s\t%s\n' "$path" "$size" "-" "$git"
+    fi
+  done < "$TREE4"
+}
+
+# Print "org/model" for every managed model under a base dir (dirs carrying a
+# .hfget/manifest.tsv). Layout is <base>/<org>/<model>/.
+discover_models() {
+  local base=$1 g id
+  [[ -d $base ]] || return 0
+  for g in "$base"/*/*/"$MANIFEST_REL"; do
+    [[ -f $g ]] || continue
+    id=${g#"$base"/}
+    id=${id%/"$MANIFEST_REL"}
+    printf '%s\n' "$id"
+  done
+}
+
+# Echo the current commit sha for a model id @ rev (empty if unreadable). Uses
+# the model-info endpoint and never dies — 'outdated' scans many models.
+current_commit() {
+  local id=$1 rev=$2 renc code
+  renc=$(jq -rn --arg r "$rev" '$r | @uri')
+  code=$(curl -sS -H @"$HDRS" -o "$TMPD/minfo" -w '%{http_code}' \
+              --connect-timeout 15 --max-time 60 \
+              "$HF/api/models/$id?revision=$renc" </dev/null 2>/dev/null || echo 000)
+  [[ $code == 200 ]] || { printf ''; return 0; }
+  jq -r '.sha // empty' "$TMPD/minfo" 2>/dev/null || printf ''
+}
+
+# ===========================================================================
+#  update / outdated  — commands
+# ===========================================================================
+
+# Keep only rows whose path matches the active INCLUDES/EXCLUDES (no-op when
+# neither is set). Path is column 1.
+filter_cls() {
+  [[ ${#INCLUDES[@]} -gt 0 || ${#EXCLUDES[@]} -gt 0 ]] || return 0
+  local f=$1 tmp="$1.f" path size lfs git
+  : > "$tmp"
+  while IFS=$'\t' read -r path size lfs git; do
+    if [[ ${#INCLUDES[@]} -gt 0 ]] && ! matches_any "$path" "${INCLUDES[@]}"; then continue; fi
+    if [[ ${#EXCLUDES[@]} -gt 0 ]] && matches_any "$path" "${EXCLUDES[@]}"; then continue; fi
+    printf '%s\t%s\t%s\t%s\n' "$path" "$size" "$lfs" "$git" >> "$tmp"
+  done < "$f"
+  mv -f "$tmp" "$f"
+}
+
+# Drop rows from $1 (path in col 1) whose path appears in the newline list $2.
+exclude_by_path() {
+  local rows=$1 drop=$2 tmp="$1.x"
+  [[ -s $drop ]] || return 0
+  awk -F '\t' 'FNR == NR { d[$0] = 1; next } !($1 in d)' "$drop" "$rows" > "$tmp" && mv -f "$tmp" "$rows"
+}
+
+# Execute the planned local renames (src \t dst, relative to DEST). Guarded to
+# stay inside DEST_REAL and never follow a symlink.
+apply_renames() {
+  [[ -s ${RENAMES:-/nonexistent} ]] || return 0
+  local src dst s d ddir
+  while IFS=$'\t' read -r src dst; do
+    s="$DEST/$src"; d="$DEST/$dst"
+    [[ -f $s && ! -L $s ]] || continue
+    mkdir -p "$(dirname "$d")"
+    ddir=$(cd "$(dirname "$d")" 2>/dev/null && pwd -P) || ddir=''
+    if [[ -z $ddir || ( $ddir != "$DEST_REAL" && $ddir != "$DEST_REAL"/* ) ]]; then continue; fi
+    if [[ -L $d ]]; then continue; fi
+    if mv -f "$s" "$d" 2>/dev/null; then info "  moved: $src → $dst"; fi
+  done < "$RENAMES"
+}
+
+# Delete the stale files (STALE_FINAL). Only removes regular files that resolve
+# inside DEST_REAL; refuses symlinks. Best-effort cleanup of emptied dirs.
+prune_stale() {
+  local path size lfs git f fdir removed=0
+  while IFS=$'\t' read -r path size lfs git; do
+    f="$DEST/$path"
+    [[ -e $f ]] || continue
+    if [[ -L $f ]]; then warn "  refusing to remove a symlink: $path"; continue; fi
+    fdir=$(cd "$(dirname "$f")" 2>/dev/null && pwd -P) || fdir=''
+    if [[ -z $fdir || ( $fdir != "$DEST_REAL" && $fdir != "$DEST_REAL"/* ) ]]; then
+      warn "  refusing to remove outside the destination: $path"; continue
+    fi
+    if rm -f "$f"; then removed=$((removed + 1)); rmdir -p "$(dirname "$f")" 2>/dev/null || true; fi
+  done < "$STALE_FINAL"
+  info "  removed $removed stale file(s)"
+}
+
+# Move the stale files into $DEST/.hfget-old/<timestamp>/ instead of deleting.
+backup_stale() {
+  local ts base path size lfs git f d moved=0
+  ts=$(date -u +%Y%m%dT%H%M%SZ)
+  base="$DEST/.hfget-old/$ts"
+  while IFS=$'\t' read -r path size lfs git; do
+    f="$DEST/$path"; d="$base/$path"
+    [[ -e $f ]] || continue
+    if [[ -L $f ]]; then continue; fi
+    mkdir -p "$(dirname "$d")"
+    if mv -f "$f" "$d" 2>/dev/null; then moved=$((moved + 1)); rmdir -p "$(dirname "$f")" 2>/dev/null || true; fi
+  done < "$STALE_FINAL"
+  info "  moved $moved stale file(s) → $base"
+}
+
+# Refresh one model in place: fetch the current tree, diff it against the
+# in-folder manifest, download only what changed/is new, reconcile stale files,
+# and rewrite the manifest. Reads the per-run flags (rehash, stale_mode, REV_*)
+# from cmd_update via dynamic scope. Returns non-zero on any failure (so --all
+# can carry on to the next model).
+update_one() {
+  local model=$1 mf mrows have_manifest=0
+
+  MODEL=$model
+  normalize_model_id "$MODEL"; MODEL=$NORM_MODEL
+  [[ $MODEL =~ $MODEL_ID_RE ]] || { warn "'$model' does not look like a model id (org/model) — skipping"; return 1; }
+  case "/$MODEL/" in */../*) warn "invalid model id '$MODEL' (contains '..') — skipping"; return 1 ;; esac
+
+  DEST="$BASE/$MODEL"
+  read_manifest_header "$DEST" || true
+  # Target revision: forced -r > URL rev > manifest's recorded rev > main.
+  if [[ $REV_FORCED -eq 1 ]]; then REV=$REV_ARG
+  elif [[ -n ${NORM_UREV:-} ]]; then REV=$NORM_UREV
+  elif [[ -n ${MANIFEST_REV:-} ]]; then REV=$MANIFEST_REV
+  else REV=main; fi
+  [[ -n $REV ]] || REV=main
+
+  if [[ -d $DEST ]]; then DEST_REAL=$(cd "$DEST" && pwd -P); else DEST_REAL=''; fi
+
+  info ""
+  info "${C_DIM}checking $MODEL @ $REV …${C_OFF}"
+  WANT_OIDS=1
+  fetch_tree
+  build_tree4 || { warn "$MODEL: could not read file oids from the tree — skipping"; return 1; }
+
+  mf=$(manifest_file "$DEST")
+  mrows="$TMPD/mrows"; : > "$mrows"
+  if [[ -f $mf ]]; then
+    read_manifest_rows "$DEST" > "$mrows" 2>/dev/null || true
+    [[ -s $mrows ]] && have_manifest=1
+  fi
+  if [[ $rehash -eq 1 ]]; then
+    synth_manifest_by_hash > "$mrows"
+    if [[ -s $mrows ]]; then have_manifest=1; else have_manifest=0; fi
+  fi
+
+  classify_diff "$have_manifest" "$mrows"
+
+  # A manifest may call a file unchanged while it's missing/short on disk now.
+  if [[ -s $CLS_UNCH ]]; then
+    local ukeep="$TMPD/cls_unch.keep" up us ul ug uo
+    : > "$ukeep"
+    while IFS=$'\t' read -r up us ul ug; do
+      uo="$DEST/$up"
+      if [[ -f $uo && $(filesize "$uo") -eq $us ]]; then
+        printf '%s\t%s\t%s\t%s\n' "$up" "$us" "$ul" "$ug" >> "$ukeep"
+      else
+        printf '%s\t%s\t%s\t%s\n' "$up" "$us" "$ul" "$ug" >> "$CLS_NEW"
+      fi
+    done < "$CLS_UNCH"
+    mv -f "$ukeep" "$CLS_UNCH"
+  fi
+
+  filter_cls "$CLS_CHANGED"
+  filter_cls "$CLS_NEW"
+
+  # Rename optimization: a to-download file whose content id equals a stale
+  # file's is a move — rename locally rather than re-download.
+  RENAMES="$TMPD/renames"; : > "$RENAMES"
+  if [[ -s $CLS_STALE ]] && { [[ -s $CLS_CHANGED ]] || [[ -s $CLS_NEW ]]; }; then
+    cat "$CLS_CHANGED" "$CLS_NEW" > "$TMPD/dlset"
+    awk -F '\t' -v ren="$RENAMES" '
+      function id(lfs, git) { return (lfs != "-" && lfs != "") ? lfs : git }
+      FNR == NR { k = id($3, $4); if (!(k in sp)) sp[k] = $1; next }
+      { k = id($3, $4); if (k in sp && !(k in used)) { print sp[k] "\t" $1 > ren; used[k] = 1 } }
+    ' "$CLS_STALE" "$TMPD/dlset"
+  fi
+  if [[ -s $RENAMES ]]; then
+    cut -f2 "$RENAMES" > "$TMPD/ren_dst"
+    cut -f1 "$RENAMES" > "$TMPD/ren_src"
+    exclude_by_path "$CLS_CHANGED" "$TMPD/ren_dst"
+    exclude_by_path "$CLS_NEW" "$TMPD/ren_dst"
+    exclude_by_path "$CLS_STALE" "$TMPD/ren_src"
+  fi
+
+  # Stale = recorded-but-gone files still present on disk (rename sources removed).
+  STALE_FINAL="$TMPD/stale_final"; : > "$STALE_FINAL"
+  if [[ -s $CLS_STALE ]]; then
+    local sp ss sl sg
+    while IFS=$'\t' read -r sp ss sl sg; do
+      [[ -e "$DEST/$sp" ]] || continue
+      printf '%s\t%s\t%s\t%s\n' "$sp" "$ss" "$sl" "$sg" >> "$STALE_FINAL"
+    done < "$CLS_STALE"
+  fi
+
+  # Work list: changed (fresh) first, then new (resumable).
+  WORK_TSV="$TMPD/work.tsv"; : > "$WORK_TSV"
+  n_work=0; need_bytes=0
+  local wp ws wl haveb
+  while IFS=$'\t' read -r wp ws wl _; do
+    n_work=$((n_work + 1)); need_bytes=$((need_bytes + ws))
+    printf '%s\t%s\t%s\t%s\t%s\n' "$n_work" "$ws" "$wl" "$wp" "changed" >> "$WORK_TSV"
+  done < "$CLS_CHANGED"
+  while IFS=$'\t' read -r wp ws wl _; do
+    n_work=$((n_work + 1)); haveb=0
+    if [[ -f "$DEST/$wp.part" ]]; then haveb=$(filesize "$DEST/$wp.part"); fi
+    if [[ $haveb -gt $ws ]]; then haveb=0; fi
+    need_bytes=$((need_bytes + ws - haveb))
+    printf '%s\t%s\t%s\t%s\t%s\n' "$n_work" "$ws" "$wl" "$wp" "new" >> "$WORK_TSV"
+  done < "$CLS_NEW"
+
+  local n_unch b_unch n_changed b_changed n_new b_new n_stale b_stale n_ren
+  n_unch=$(nrows "$CLS_UNCH");     b_unch=$(bsum "$CLS_UNCH")
+  n_changed=$(nrows "$CLS_CHANGED"); b_changed=$(bsum "$CLS_CHANGED")
+  n_new=$(nrows "$CLS_NEW");        b_new=$(bsum "$CLS_NEW")
+  n_stale=$(nrows "$STALE_FINAL");  b_stale=$(bsum "$STALE_FINAL")
+  n_ren=$(nrows "$RENAMES")
+
+  info ""
+  info "update:       $MODEL @ $REV"
+  info "destination:  $DEST"
+  info "  unchanged:  $(printf '%4d' "$n_unch") file(s)  $(human "$b_unch")"
+  if [[ $n_ren -gt 0 ]]; then info "  moved:      $(printf '%4d' "$n_ren") file(s)          (renamed locally — no re-download)"; fi
+  info "  changed:    $(printf '%4d' "$n_changed") file(s)  $(human "$b_changed")"
+  info "  new:        $(printf '%4d' "$n_new") file(s)  $(human "$b_new")"
+  if [[ $n_stale -gt 0 ]]; then
+    local slabel
+    if [[ $stale_mode == keep ]]; then slabel="keep"
+    elif [[ $stale_mode == backup ]]; then slabel="move to .hfget-old/"
+    elif [[ $stale_mode == prune ]]; then slabel="remove"
+    elif [[ $have_manifest -eq 1 ]]; then slabel="ask, then remove"
+    else slabel="keep (no manifest yet)"; fi
+    info "  stale:      $(printf '%4d' "$n_stale") file(s)  $(human "$b_stale")  — $slabel"
+  fi
+  info "  to fetch:   $(human "$need_bytes")"
+
+  if [[ $n_work -eq 0 && $n_ren -eq 0 && $n_stale -eq 0 ]]; then
+    info "${C_GRN}up to date${C_OFF}${REPO_COMMIT:+ (commit ${REPO_COMMIT:0:12})}"
+    if [[ -n $DEST_REAL ]]; then build_tree4; write_manifest; fi
+    return 0
+  fi
+
+  if [[ $DRYRUN -eq 1 ]]; then
+    info "${C_DIM}dry run — nothing changed${C_OFF}"
+    return 0
+  fi
+
+  if [[ $n_work -gt 0 ]]; then
+    awk -F '\t' '{ print $2 "\t" $3 "\t" $4 }' "$WORK_TSV" > "$TMPD/dlview.tsv"
+    overview_tsv "$TMPD/dlview.tsv"
+    if ! size_guard "$need_bytes" "update"; then
+      warn "$MODEL: aborted — nothing changed"
+      return 1
+    fi
+  fi
+
+  local probe avail_kb avail_bytes
+  probe=$BASE
+  while [[ ! -d $probe && $probe != / && $probe != . ]]; do probe=$(dirname "$probe"); done
+  avail_kb=$(df -Pk "$probe" 2>/dev/null | awk 'NR == 2 { print $4 }')
+  case "$avail_kb" in ''|*[!0-9]*) avail_kb=0 ;; esac
+  avail_bytes=$(( avail_kb * 1024 ))
+  if [[ $avail_bytes -gt 0 && $need_bytes -gt $avail_bytes ]]; then
+    warn "$MODEL: not enough free space ($(human "$need_bytes") needed, $(human "$avail_bytes") free) — skipping"
+    return 1
+  fi
+
+  local do_prune=0 do_backup=0
+  if [[ $n_stale -gt 0 ]]; then
+    if [[ $stale_mode == prune ]]; then do_prune=1
+    elif [[ $stale_mode == backup ]]; then do_backup=1
+    elif [[ $stale_mode == keep ]]; then :
+    elif [[ $have_manifest -eq 0 ]]; then
+      warn "$MODEL: $n_stale file(s) here aren't in @ $REV, but there is no manifest to prove hfget put them there — keeping (use --prune / --backup to act)"
+    else
+      info ""
+      info "no longer in $MODEL @ $REV (recorded as downloaded by hfget):"
+      local sp ss sl sg
+      while IFS=$'\t' read -r sp ss sl sg; do
+        info "  - $(printf '%-10s' "$(human "$ss")") $sp"
+      done < "$STALE_FINAL"
+      if confirm "remove these $n_stale file(s) ($(human "$b_stale"))? (new/changed download first regardless)" n; then
+        do_prune=1
+      else
+        info "  keeping stale files"
+      fi
+    fi
+  fi
+
+  if [[ $n_work -gt 0 ]]; then
+    awk -F '\t' 'NR == 1 { print $2 "\t" $3 "\t" $4; exit }' "$WORK_TSV" > "$TMPD/probe.tsv"
+    auth_probe_first "$TMPD/probe.tsv"
+    case "$PROBE_CODE" in
+      200) ;;
+      401|403) warn "$MODEL: downloads denied (HTTP $PROBE_CODE — gated/private; accept the license and pass a token) — skipping"; return 1 ;;
+      *) warn "$MODEL: unexpected HTTP $PROBE_CODE probing the first file — attempting anyway" ;;
+    esac
+  fi
+
+  mkdir -p "$DEST" || { warn "$MODEL: cannot create $DEST — skipping"; return 1; }
+  DEST_REAL=$(cd "$DEST" && pwd -P)
+
+  apply_renames
+
+  RESULTS="$TMPD/results"; : > "$RESULTS"
+  PROGF=${HFGET_PROG:-}
+  QUIET=0; if [[ $JOBS -gt 1 || ! -t 2 ]]; then QUIET=1; fi
+  local n_ok=0 n_skip=0 n_fail=0
+  if [[ $n_work -gt 0 ]]; then
+    info ""
+    run_worklist
+    read -r n_ok n_skip n_fail <<< "$(awk -F '\t' '
+      $1 == "OK" { o++ } $1 == "SKIP" { s++ } $1 == "FAIL" { f++ }
+      END { printf "%d %d %d", o + 0, s + 0, f + 0 }' "$RESULTS" 2>/dev/null || echo "0 0 0")"
+  fi
+
+  if [[ ${n_fail:-0} -gt 0 ]]; then
+    warn "$MODEL: $n_fail file(s) failed — stale files kept and the manifest is unchanged"
+    warn "rerun 'hfget update $MODEL' to retry (completed files are skipped, partial files resume)"
+    return 1
+  fi
+
+  local manifest_extra=''
+  if [[ $n_stale -gt 0 ]]; then
+    if [[ $do_prune -eq 1 ]]; then prune_stale
+    elif [[ $do_backup -eq 1 ]]; then backup_stale
+    else info "  ${C_DIM}stale files kept${C_OFF}"; manifest_extra=$STALE_FINAL; fi
+  fi
+
+  build_tree4; write_manifest "$manifest_extra"
+
+  info "${C_GRN}updated${C_OFF} $MODEL — ${n_ok} fetched, ${n_unch} kept$( [[ $n_ren -gt 0 ]] && printf ', %d moved' "$n_ren" || true )$( [[ $n_stale -gt 0 && $do_prune -eq 1 ]] && printf ', %d removed' "$n_stale" || true ) → $DEST"
+  return 0
+}
+
+cmd_update() {
+  MODEL='' BASE='' TOKEN='' REV='' REV_ARG='' REV_FORCED=0
+  JOBS=1 VERIFY=0 REQUIRE_MOUNT=0 DRYRUN=0
+  INCLUDES=() EXCLUDES=()
+  local do_all=0 rehash=0 stale_mode=ask a
+  local models=() realmodels=()
+
+  need_val() { [[ $# -ge 2 ]] || die "option $1 requires a value"; }
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -r|--revision)   need_val "$@"; REV_ARG=$2; REV_FORCED=1; shift 2 ;;
+      -i|--include)    need_val "$@"; INCLUDES+=("$2"); shift 2 ;;
+      -x|--exclude)    need_val "$@"; EXCLUDES+=("$2"); shift 2 ;;
+      -t|--token)      need_val "$@"; TOKEN=$2
+                       warn "a token passed via -t is visible in 'ps' and shell history; prefer \$HF_TOKEN or the hf token file"
+                       shift 2 ;;
+      -j|--jobs)       need_val "$@"; JOBS=$2; shift 2 ;;
+      --verify)        VERIFY=1; shift ;;
+      --rehash)        rehash=1; VERIFY=1; shift ;;
+      --all)           do_all=1; shift ;;
+      --prune)         stale_mode=prune; shift ;;
+      --keep)          stale_mode=keep; shift ;;
+      --backup)        stale_mode=backup; shift ;;
+      --require-mount) REQUIRE_MOUNT=1; shift ;;
+      -n|--dry-run)    DRYRUN=1; shift ;;
+      -y|--yes)        YES=1; shift ;;
+      -h|--help)       usage; exit 0 ;;
+      -*)              die "unknown option: $1 (see --help)" ;;
+      *)               models+=("$1"); shift ;;
+    esac
+  done
+
+  local jobs_re='^[0-9]+$'
+  if ! [[ $JOBS =~ $jobs_re ]] || [[ $JOBS -lt 1 || $JOBS -gt 16 ]]; then
+    die "--jobs must be a number between 1 and 16"
+  fi
+
+  for a in ${models[@]+"${models[@]}"}; do
+    case "$a" in
+      /*|./*|../*|~*|.) [[ -z $BASE ]] || die "more than one base dir given ('$BASE' and '$a')"; BASE=$a ;;
+      *)                realmodels+=("$a") ;;
+    esac
+  done
+  if [[ -z $BASE ]]; then BASE=${HFGET_DEST:-${HF_NAS_DIR:-}}; fi
+
+  if [[ $do_all -eq 1 ]]; then
+    [[ -n $BASE ]] || die "update --all needs a base dir (as an argument, or set HFGET_DEST)"
+    [[ -d $BASE ]] || die "not a directory: $BASE"
+    local m
+    while IFS= read -r m; do [[ -n $m ]] && realmodels+=("$m"); done < <(discover_models "$BASE")
+    if [[ ${#realmodels[@]} -eq 0 ]]; then
+      info "no hfget-managed models found under $BASE"
+      info "${C_DIM}(download a model, or run 'hfget update <org/model>' once, to create its manifest)${C_OFF}"
+      exit 0
+    fi
+    info "${C_DIM}found ${#realmodels[@]} managed model(s) under $BASE${C_OFF}"
+  else
+    [[ ${#realmodels[@]} -gt 0 ]] || die "usage: hfget update <org/model> [base-dir] [options]   (bulk: hfget update --all [base-dir])"
+    [[ -n $BASE ]] || die "no destination: pass a base dir as an argument, or set HFGET_DEST"
+  fi
+
+  resolve_token
+  setup_net
+
+  # shellcheck disable=SC2317,SC2329  # invoked via trap
+  on_interrupt() {
+    trap - INT TERM
+    printf '\n' >&2
+    warn "interrupted — partial *.part files are kept; rerun 'hfget update' to resume"
+    rm -rf "$TMPD"
+    pids=$(jobs -pr 2>/dev/null || true)
+    # shellcheck disable=SC2086
+    if [[ -n $pids ]]; then kill $pids 2>/dev/null || true; fi
+    exit 130
+  }
+  trap on_interrupt INT TERM
+
+  local rc_all=0 model
+  for model in "${realmodels[@]}"; do
+    update_one "$model" || rc_all=1
+  done
+  exit "$rc_all"
+}
+
+# Report which managed models under a base dir have upstream updates, using one
+# cheap commit-sha check per model (no tree walk, no downloads).
+cmd_outdated() {
+  BASE='' TOKEN=''
+  local a
+  need_val() { [[ $# -ge 2 ]] || die "option $1 requires a value"; }
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -t|--token) need_val "$@"; TOKEN=$2; shift 2 ;;
+      -h|--help)  usage; exit 0 ;;
+      -*)         die "unknown option: $1 (see --help)" ;;
+      *)          [[ -z $BASE ]] || die "unexpected argument: $1"; BASE=$1; shift ;;
+    esac
+  done
+  if [[ -z $BASE ]]; then BASE=${HFGET_DEST:-${HF_NAS_DIR:-}}; fi
+  [[ -n $BASE ]] || die "no base dir: pass one as an argument, or set HFGET_DEST"
+  [[ -d $BASE ]] || die "not a directory: $BASE"
+
+  resolve_token
+  setup_net
+
+  info "${C_DIM}checking managed models under $BASE …${C_OFF}"
+  local id mrev cur n=0 upd=0 unknown=0
+  while IFS= read -r id; do
+    [[ -n $id ]] || continue
+    n=$((n + 1))
+    if ! read_manifest_header "$BASE/$id"; then
+      info "  $(printf '%-38s' "$id") ${C_DIM}(unreadable manifest)${C_OFF}"; unknown=$((unknown + 1)); continue
+    fi
+    mrev=${MANIFEST_REV:-main}
+    cur=$(current_commit "$id" "$mrev")
+    if [[ -z $cur ]]; then
+      info "  $(printf '%-38s' "$id") ${C_DIM}rev=$mrev — could not check${C_OFF}"; unknown=$((unknown + 1))
+    elif [[ -n ${MANIFEST_COMMIT:-} && $cur == "$MANIFEST_COMMIT" ]]; then
+      info "  $(printf '%-38s' "$id") ${C_GRN}up to date${C_OFF}  (rev=$mrev @ ${cur:0:12})"
+    else
+      upd=$((upd + 1))
+      info "  $(printf '%-38s' "$id") ${C_YLW}update available${C_OFF}  (rev=$mrev: ${MANIFEST_COMMIT:0:12} → ${cur:0:12})"
+    fi
+  done < <(discover_models "$BASE")
+
+  info ""
+  if [[ $n -eq 0 ]]; then
+    info "no hfget-managed models found under $BASE"
+    info "${C_DIM}(download a model, or run 'hfget update <org/model>' once, to create its manifest)${C_OFF}"
+  else
+    info "checked $n model(s): ${upd} with updates, $((n - upd - unknown)) up to date$( [[ $unknown -gt 0 ]] && printf ', %d unchecked' "$unknown" || true )"
+    if [[ $upd -gt 0 ]]; then info "refresh them with: hfget update --all $BASE   (or: hfget update <org/model>)"; fi
+  fi
+}
+
+# ===========================================================================
+#  shared download engine (used by 'download' and 'update')
+# ===========================================================================
+# Download one repo file. Args: idx, size, lfs-sha (or "-"), repo path, and an
+# optional mode. mode="changed" means the file already exists at full size but
+# its content moved upstream: start a fresh .part and let the final atomic mv
+# overwrite it (never resume onto stale bytes). Any other mode keeps the normal
+# size-skip + resume. Relies on caller-set globals: DEST DEST_REAL MODEL REV_ENC
+# HDRS VERIFY n_work RESULTS PROGF QUIET MIN_SPEED SPEED_TIME.
+fetch_one() {
+  local idx=$1 size=$2 lfs=$3 path=$4 mode=${5:-0}
+  local out="$DEST/$path" part url have got rc code stall pre fstart start_have sum outdir
+  part="$out.part"
+  mkdir -p "$(dirname "$out")"
+
+  # Refuse to write through a symlink, or into a directory that resolves outside
+  # DEST — defends a shared/group-writable destination against a pre-planted
+  # symlink (file target truncation, or a directory-symlink escape).
+  outdir=$(cd "$(dirname "$out")" 2>/dev/null && pwd -P) || outdir=''
+  if [[ -z $outdir || ( $outdir != "$DEST_REAL" && $outdir != "$DEST_REAL"/* ) || -L $out || -L $part ]]; then
+    warn "[$idx/$n_work] FAILED: $path (destination resolves outside $DEST or is a symlink — refusing to write)"
+    printf 'FAIL\t0\t%s\n' "$path" >> "$RESULTS"
+    return 1
+  fi
+
+  if [[ $mode == changed ]]; then
+    : > "$part"        # content changed upstream — never resume onto stale bytes
+  elif [[ -f $out && $(filesize "$out") -eq $size ]]; then
+    printf 'SKIP\t0\t%s\n' "$path" >> "$RESULTS"
+    return 0
+  fi
+
+  url="$HF/$MODEL/resolve/$REV_ENC/$(enc_path "$path")"
+  if [[ ! -f $part ]]; then : > "$part"; fi
+  have=$(filesize "$part")
+  if [[ $have -gt $size ]]; then : > "$part"; have=0; fi
+  start_have=$have
+  if [[ -n ${PROGF:-} ]]; then printf 'C\t%s\t%s\t%s\n' "$size" "$start_have" "$path" >> "$PROGF"; fi
+
+  if [[ $QUIET -eq 0 ]]; then
+    if [[ $start_have -gt 0 ]]; then
+      info "[$idx/$n_work] $path ($(human "$size")) ${C_DIM}— resuming at $(human "$start_have")${C_OFF}"
+    else
+      info "[$idx/$n_work] $path ($(human "$size"))"
+    fi
+  elif [[ $start_have -gt 0 ]]; then
+    info "[$idx/$n_work] resuming $path at $(human "$start_have") of $(human "$size")"
+  fi
+
+  # Cap the transfer at the declared size (+1 MB slack) so a bogus oversized or
+  # length-less response can't fill the disk. Skipped for zero-length files.
+  local maxfs=()
+  if [[ $size -gt 0 ]]; then maxfs=(--max-filesize "$((size + 1048576))"); fi
+
+  stall=0; fstart=$(date +%s)
+  while :; do
+    rc=0 code=200
+    pre=$(filesize "$part")
+    if [[ $pre -lt $size ]]; then
+      if [[ $QUIET -eq 1 ]]; then
+        code=$(curl -fsSL -H @"$HDRS" ${maxfs[@]+"${maxfs[@]}"} --connect-timeout 15 --retry 2 --retry-delay 2 \
+                    --speed-limit "$MIN_SPEED" --speed-time "$SPEED_TIME" \
+                    -C - -o "$part" -w '%{http_code}' "$url" </dev/null) || rc=$?
+      else
+        code=$(curl -fSL --progress-bar -H @"$HDRS" ${maxfs[@]+"${maxfs[@]}"} --connect-timeout 15 --retry 2 --retry-delay 2 \
+                    --speed-limit "$MIN_SPEED" --speed-time "$SPEED_TIME" \
+                    -C - -o "$part" -w '%{http_code}' "$url" </dev/null) || rc=$?
+      fi
+    fi
+    got=$(filesize "$part")
+    if [[ $rc -eq 0 && $got -eq $size ]]; then break; fi
+    if [[ $got -gt $size ]]; then : > "$part"; got=0; fi
+    # Hard per-file backstop: a server that dribbles just enough to look alive
+    # can't keep us here forever.
+    if [[ $(( $(date +%s) - fstart )) -gt 43200 ]]; then
+      warn "[$idx/$n_work] FAILED: $path (still incomplete after 12h — a stalling server?; have $(human "$got") of $(human "$size"))"
+      printf 'FAIL\t0\t%s\n' "$path" >> "$RESULTS"
+      return 1
+    fi
+    case "$code" in
+      401 | 403)
+        warn "[$idx/$n_work] FAILED: $path (HTTP $code — gated/private model; accept the license at $HF/$MODEL and pass a token via -t / \$HF_TOKEN)"
+        printf 'FAIL\t0\t%s\n' "$path" >> "$RESULTS"
+        return 1 ;;
+      404)
+        warn "[$idx/$n_work] FAILED: $path (HTTP 404 — the file vanished from the repo?)"
+        printf 'FAIL\t0\t%s\n' "$path" >> "$RESULTS"
+        return 1 ;;
+    esac
+    # Self-healing: an abort that still moved bytes forward (curl exit 28 from
+    # the speed floor, or a dropped connection) is just a reconnect — resume
+    # immediately and don't count it. Give up only after 3 attempts that make
+    # NO progress at all. Reset the stall counter only on MEANINGFUL progress
+    # (>= 4 KB), so a server trickling a byte per reconnect can't reset forever.
+    if [[ $((got - pre)) -ge 4096 ]]; then
+      stall=0
+      if [[ $rc -eq 28 && $QUIET -eq 0 ]]; then
+        info "[$idx/$n_work] ${C_DIM}slow connection (<$(human "$MIN_SPEED")/s) — reconnecting…${C_OFF}"
+      fi
+    else
+      stall=$((stall + 1))
+      if [[ $stall -ge 3 ]]; then
+        warn "[$idx/$n_work] FAILED: $path (curl exit $rc, HTTP $code; no meaningful progress after 3 attempts; have $(human "$got") of $(human "$size"))"
+        printf 'FAIL\t0\t%s\n' "$path" >> "$RESULTS"
+        return 1
+      fi
+      sleep 2
+    fi
+  done
+
+  if [[ $VERIFY -eq 1 && $lfs != "-" ]]; then
+    sum=$(sha256 "$part" 2>/dev/null || echo '')
+    if [[ -z $sum ]]; then
+      warn "[$idx/$n_work] --verify: no sha256sum/shasum found — skipping checksum for $path"
+    elif [[ $sum != "$lfs" ]]; then
+      rm -f "$part"
+      warn "[$idx/$n_work] sha256 MISMATCH: $path — partial removed; rerun to re-download"
+      printf 'FAIL\t0\t%s\n' "$path" >> "$RESULTS"
+      return 1
+    fi
+  fi
+
+  if ! mv -f "$part" "$out"; then
+    warn "[$idx/$n_work] FAILED: $path (could not move into place at $DEST — check permissions/space)"
+    printf 'FAIL\t0\t%s\n' "$path" >> "$RESULTS"
+    return 1
+  fi
+  printf 'OK\t%s\t%s\n' "$((size - start_have))" "$path" >> "$RESULTS"
+  if [[ -n ${PROGF:-} ]]; then printf 'F\t%s\n' "$((size - start_have))" >> "$PROGF"; fi
+  if [[ $QUIET -eq 1 ]]; then
+    info "[$idx/$n_work] ${C_GRN}done${C_OFF} $path ($(human "$size"))"
+  elif [[ $VERIFY -eq 1 && $lfs != "-" ]]; then
+    info "[$idx/$n_work] ${C_GRN}sha256 ok${C_OFF}"
+  fi
+  return 0
+}
+
+# Drain WORK_TSV (idx \t size \t lfs \t path [\t mode]) through fetch_one, either
+# sequentially or with JOBS parallel workers. Results accumulate in $RESULTS.
+run_worklist() {
+  local idx size lfs path mode
+  if [[ $JOBS -eq 1 ]]; then
+    while IFS=$'\t' read -r idx size lfs path mode; do
+      fetch_one "$idx" "$size" "$lfs" "$path" "${mode:-0}" || true
+    done < "$WORK_TSV"
+  else
+    info "${C_DIM}downloading with $JOBS parallel jobs${C_OFF}"
+    while IFS=$'\t' read -r idx size lfs path mode; do
+      while [[ $(jobs -pr | wc -l) -ge $JOBS ]]; do sleep 0.3; done
+      fetch_one "$idx" "$size" "$lfs" "$path" "${mode:-0}" &
+    done < "$WORK_TSV"
+    wait
+  fi
+}
+
 # ---------------------------------------------------------------- dispatch --
 # Only dispatch when executed as a program; when sourced (tests), stop here so
 # the test harness can call individual functions in isolation.
 if [[ $HFGET_SOURCED -eq 0 ]]; then
 case "${1:-}" in
   download)       shift; cmd_download "$@" ;;
+  update)         shift; cmd_update "$@" ;;
+  outdated)       shift; cmd_outdated "$@" ;;
   add)            shift; cmd_add "$@" ;;
   queue)          shift; cmd_queue "$@" ;;
   status)         shift; cmd_status "$@" ;;
