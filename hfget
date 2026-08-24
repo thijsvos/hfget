@@ -1337,13 +1337,20 @@ read_manifest_rows() {
 
 # Parse a manifest's header into MANIFEST_REV / MANIFEST_COMMIT (empty if none).
 read_manifest_header() {
-  local mf hdr; mf=$(manifest_file "$1")
-  MANIFEST_REV=''; MANIFEST_COMMIT=''
+  local mf hdr g; mf=$(manifest_file "$1")
+  MANIFEST_REV=''; MANIFEST_COMMIT=''; MANIFEST_INCLUDES=(); MANIFEST_EXCLUDES=()
   [[ -f $mf ]] || return 1
-  hdr=$(grep -m1 '^#' "$mf" 2>/dev/null || true)
+  hdr=$(grep -m1 '^# hfget ' "$mf" 2>/dev/null || true)
   [[ -n $hdr ]] || return 1
   MANIFEST_REV=$(printf '%s\n' "$hdr" | sed -n 's/.*[[:space:]]rev=\([^[:space:]]*\).*/\1/p')
   MANIFEST_COMMIT=$(printf '%s\n' "$hdr" | sed -n 's/.*[[:space:]]commit=\([^[:space:]]*\).*/\1/p')
+  # Recorded per-model filter (globs the user downloaded with), one per line.
+  while IFS=$'\t' read -r _ g; do
+    if [[ -n $g ]]; then MANIFEST_INCLUDES+=("$g"); fi
+  done < <(grep '^# include' "$mf" 2>/dev/null || true)
+  while IFS=$'\t' read -r _ g; do
+    if [[ -n $g ]]; then MANIFEST_EXCLUDES+=("$g"); fi
+  done < <(grep '^# exclude' "$mf" 2>/dev/null || true)
   return 0
 }
 
@@ -1357,7 +1364,7 @@ write_manifest() {
   local extra=${1:-}
   [[ -z ${HFGET_NO_MANIFEST:-} ]] || return 0
   [[ -n ${TREE4:-} && -f ${TREE4:-/nonexistent} ]] || return 0
-  local mdir="$DEST/.hfget" mf mtmp ts real path size lfs git out
+  local mdir="$DEST/.hfget" mf mtmp ts real path size lfs git out g
   real=$(cd "$DEST" 2>/dev/null && pwd -P) || return 0
   [[ $real == "$DEST_REAL" ]] || return 0
   mkdir -p "$mdir" 2>/dev/null || return 0
@@ -1366,6 +1373,11 @@ write_manifest() {
   ts=$(date -u +%FT%TZ)
   {
     printf '# hfget %s rev=%s commit=%s updated=%s\n' "$VERSION" "$REV" "${REPO_COMMIT:-}" "$ts"
+    # Remember the filter this model was downloaded with, so a later 'update'
+    # (or 'update --all') stays pinned to the same subset (e.g. one GGUF quant)
+    # instead of expanding to the whole repo.
+    for g in ${INCLUDES[@]+"${INCLUDES[@]}"}; do printf '# include\t%s\n' "$g"; done
+    for g in ${EXCLUDES[@]+"${EXCLUDES[@]}"}; do printf '# exclude\t%s\n' "$g"; done
     while IFS=$'\t' read -r path size lfs git; do
       out="$DEST/$path"
       [[ -f $out && $(filesize "$out") -eq $size ]] || continue
@@ -1554,6 +1566,20 @@ update_one() {
   elif [[ -n ${MANIFEST_REV:-} ]]; then REV=$MANIFEST_REV
   else REV=main; fi
   [[ -n $REV ]] || REV=main
+
+  # Per-model filter: start from what the user typed this run; if they gave none,
+  # inherit the filter recorded in THIS model's manifest — so a partial download
+  # (e.g. a single GGUF quant) stays partial instead of expanding to the whole
+  # repo. An explicit -i/-x always overrides and is re-recorded.
+  INCLUDES=(${USER_INC[@]+"${USER_INC[@]}"})
+  EXCLUDES=(${USER_EXC[@]+"${USER_EXC[@]}"})
+  if [[ ${#INCLUDES[@]} -eq 0 && ${#EXCLUDES[@]} -eq 0 ]]; then
+    INCLUDES=(${MANIFEST_INCLUDES[@]+"${MANIFEST_INCLUDES[@]}"})
+    EXCLUDES=(${MANIFEST_EXCLUDES[@]+"${MANIFEST_EXCLUDES[@]}"})
+    if [[ ${#INCLUDES[@]} -gt 0 || ${#EXCLUDES[@]} -gt 0 ]]; then
+      info "  ${C_DIM}(keeping this model's recorded filter: ${INCLUDES[*]}${EXCLUDES[*]:+ ! ${EXCLUDES[*]}})${C_OFF}"
+    fi
+  fi
 
   if [[ -d $DEST ]]; then DEST_REAL=$(cd "$DEST" && pwd -P); else DEST_REAL=''; fi
 
@@ -1829,6 +1855,11 @@ cmd_update() {
     [[ ${#realmodels[@]} -gt 0 ]] || die "usage: hfget update <org/model> [base-dir] [options]   (bulk: hfget update --all [base-dir])"
     [[ -n $BASE ]] || die "no destination: pass a base dir as an argument, or set HFGET_DEST"
   fi
+
+  # Remember the filter the user typed (if any) so each model in an --all run can
+  # start clean and, when the user gave none, inherit its own recorded filter.
+  USER_INC=(${INCLUDES[@]+"${INCLUDES[@]}"})
+  USER_EXC=(${EXCLUDES[@]+"${EXCLUDES[@]}"})
 
   resolve_token
   setup_net

@@ -30,6 +30,10 @@ Smart, incremental model updates.
   base dir in a single pass.
 - `--rehash` re-hashes local files to detect same-size changes exactly on the
   first update of a folder that predates manifests.
+- **Filters are remembered.** A model downloaded or updated with `-i`/`-x`
+  records those globs in its manifest, so a later `update` (and `update --all`)
+  stays pinned to the same subset — e.g. a single GGUF quant won't expand to the
+  whole repo. An explicit `-i`/`-x` overrides and is re-recorded.
 
 ### Changed
 - The download engine (`fetch_one` + the work-list loop) is now shared by

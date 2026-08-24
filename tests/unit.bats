@@ -173,6 +173,20 @@ setup() {
   rm -rf "$TMPD"
 }
 
+@test "manifest records and reads back the download filter" {
+  TMPD="$(mktemp -d)"; DEST="$TMPD/dest"; mkdir -p "$DEST"
+  DEST_REAL="$(cd "$DEST" && pwd -P)"; REV=main; REPO_COMMIT=xyz
+  printf 'AAAA' > "$DEST/keep.gguf"
+  TREE4="$TMPD/tree4"; printf 'keep.gguf\t4\tsha\t-\n' > "$TREE4"
+  INCLUDES=('*Q8_0*'); EXCLUDES=('*foo*')
+  write_manifest
+  INCLUDES=(); EXCLUDES=()
+  read_manifest_header "$DEST"
+  [ "${MANIFEST_INCLUDES[*]}" = "*Q8_0*" ]
+  [ "${MANIFEST_EXCLUDES[*]}" = "*foo*" ]
+  rm -rf "$TMPD"
+}
+
 @test "discover_models finds org/model dirs carrying a manifest" {
   base="$(mktemp -d)"
   mkdir -p "$base/orgA/modelX/.hfget" "$base/orgB/modelY/.hfget" "$base/orgC/plain"

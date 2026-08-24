@@ -155,6 +155,12 @@ hfget itself recorded downloading, never anything you added. Change the default:
 | `--keep` | never remove — only add and replace |
 | `--backup` | move them to `<dest>/.hfget-old/<date>/` instead of deleting |
 
+**Partial downloads stay partial.** If you only kept one file of a repo — most
+often a single GGUF quant out of many — hfget remembers the `-i`/`-x` filter you
+downloaded with and re-applies it on every `update` (and `update --all`), so it
+never balloons into the whole repo. Pass `-i`/`-x` again only when you want to
+*change* what you keep.
+
 Other options mirror `download` (`-r`, `-i`/`-x`, `-t`, `-j`, `--verify`).
 `--rehash` hashes local files to detect same-size changes exactly on the first
 update of a folder that predates manifests. Set `HFGET_NO_MANIFEST=1` to skip
