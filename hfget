@@ -1759,7 +1759,10 @@ update_one() {
 
   build_tree4; write_manifest "$manifest_extra"
 
-  info "${C_GRN}updated${C_OFF} $MODEL — ${n_ok} fetched, ${n_unch} kept$( [[ $n_ren -gt 0 ]] && printf ', %d moved' "$n_ren" || true )$( [[ $n_stale -gt 0 && $do_prune -eq 1 ]] && printf ', %d removed' "$n_stale" || true ) → $DEST"
+  local moved_note='' removed_note=''
+  if [[ $n_ren -gt 0 ]]; then moved_note=", $n_ren moved"; fi
+  if [[ $n_stale -gt 0 && $do_prune -eq 1 ]]; then removed_note=", $n_stale removed"; fi
+  info "${C_GRN}updated${C_OFF} $MODEL — ${n_ok} fetched, ${n_unch} kept${moved_note}${removed_note} → $DEST"
   return 0
 }
 
@@ -1894,7 +1897,9 @@ cmd_outdated() {
     info "no hfget-managed models found under $BASE"
     info "${C_DIM}(download a model, or run 'hfget update <org/model>' once, to create its manifest)${C_OFF}"
   else
-    info "checked $n model(s): ${upd} with updates, $((n - upd - unknown)) up to date$( [[ $unknown -gt 0 ]] && printf ', %d unchecked' "$unknown" || true )"
+    local unchecked_note=''
+    if [[ $unknown -gt 0 ]]; then unchecked_note=", $unknown unchecked"; fi
+    info "checked $n model(s): ${upd} with updates, $((n - upd - unknown)) up to date${unchecked_note}"
     if [[ $upd -gt 0 ]]; then info "refresh them with: hfget update --all $BASE   (or: hfget update <org/model>)"; fi
   fi
 }
