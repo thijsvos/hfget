@@ -4,6 +4,19 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and the project uses the
 `VERSION` string in the `hfget` script as the source of truth.
 
+## [2.8.1] — 2026-08-24
+
+### Added
+- **`hfget clear --failed`** — dismiss failed queue entries without re-running
+  them (previously the only options were `retry`, which re-attempts, or
+  `clear --all`, which wipes everything). A dead entry no longer lingers forever.
+- **`hfget rm <model>`** now removes the model from **both** pending and failed,
+  so a failed entry can be dropped by id with the same command.
+
+### Changed
+- The `status`/`queue` "failed" line now shows both actions: `retry` and
+  `clear --failed`.
+
 ## [2.8.0] — 2026-08-24
 
 Smart, incremental model updates.
