@@ -25,7 +25,8 @@ HF="https://huggingface.co"
 if [[ -n ${HFGET_STATE_DIR:-} ]]; then QDIR=$HFGET_STATE_DIR
 elif [[ -n ${XDG_STATE_HOME:-} ]]; then QDIR="$XDG_STATE_HOME/hfget"
 else QDIR="$HOME/.hfget"; fi
-SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+# This script's own path (BASH_SOURCE, so it is right when sourced by tests too).
+SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 YES=${HFGET_YES:-}   # -y/--yes or HFGET_YES=1 skips all confirmation prompts
 ALLOW_UNSAFE=0       # --allow-unsafe: fetch files the HF scanners flagged anyway
 

@@ -373,14 +373,16 @@ teardown() {
   # is not this test process — a direct child would be skipped as "our own".
   fake=$(bash -c 'exec -a "bash /somewhere/hfget download org/model-a /dest" sleep 20 >/dev/null 2>&1 & echo $!')
   sleep 0.3
-  all=$(foreign_hfget_pids)
+  # Call from a fresh child shell, as real hfget runs: the orphaned fake gets
+  # reparented to a reaper that may be this very test process, and a caller
+  # rightly ignores its own children.
+  all=$(bash -c "source '$HFGET'; foreign_hfget_pids")
   [[ " $all " == *" $fake "* ]]
-  mine=$(foreign_hfget_pids "org/model-a")
+  mine=$(bash -c "source '$HFGET'; foreign_hfget_pids org/model-a")
   [[ " $mine " == *" $fake "* ]]
-  other=$(foreign_hfget_pids "org/model")          # a prefix must not match
+  other=$(bash -c "source '$HFGET'; foreign_hfget_pids org/model")   # a prefix must not match
   [[ " $other " != *" $fake "* ]]
   kill "$fake" 2>/dev/null || true
-  wait "$fake" 2>/dev/null || true
 }
 
 # ------------------------------------------------------------ queue ops -----
