@@ -6,7 +6,9 @@
 # Files are fetched with curl directly into the destination (no local cache),
 # with resume support, retries, glob filters and optional sha256 verification.
 # The queue lets you enqueue N models; a background runner drains them one by
-# one (watch progress with 'hfget queue').
+# one (watch progress with 'hfget queue'). Before anything is fetched, hfget
+# asks HuggingFace's malware/pickle scanners about the repo and refuses files
+# they flagged ('hfget scan' inspects a repo, 'hfget audit' your archive).
 #
 # Runs on macOS and Linux. Requires: bash 3.2+, curl, jq, and standard
 # coreutils (awk sed grep stat df ...). 'sha256sum' or 'shasum' is needed only
@@ -17,7 +19,7 @@
 if [[ "${BASH_SOURCE[0]}" != "${0}" ]]; then HFGET_SOURCED=1; else HFGET_SOURCED=0; fi
 [[ $HFGET_SOURCED -eq 1 ]] || set -euo pipefail
 
-VERSION="2.8.1"
+VERSION="2.9.0"
 HF="https://huggingface.co"
 # State dir: explicit override > XDG state home > ~/.hfget
 if [[ -n ${HFGET_STATE_DIR:-} ]]; then QDIR=$HFGET_STATE_DIR
@@ -25,6 +27,7 @@ elif [[ -n ${XDG_STATE_HOME:-} ]]; then QDIR="$XDG_STATE_HOME/hfget"
 else QDIR="$HOME/.hfget"; fi
 SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 YES=${HFGET_YES:-}   # -y/--yes or HFGET_YES=1 skips all confirmation prompts
+ALLOW_UNSAFE=0       # --allow-unsafe: fetch files the HF scanners flagged anyway
 
 # Self-healing transfer floor: if a download stalls below MIN_SPEED bytes/sec
 # for SPEED_TIME seconds, curl aborts and hfget reconnects (resuming from the
@@ -76,7 +79,23 @@ Download now (foreground):
       --require-mount  refuse unless the destination is a network mount
                        (opt-in NAS safety; any dir is allowed by default)
       --force-local    accepted for compatibility; now a no-op (local is default)
+      --allow-unsafe   fetch files even if HuggingFace's security scanners
+                       flagged them (default: refuse, exit code 2)
   -y, --yes            skip the size-confirmation prompt
+
+Check before you trust (foreground):
+  hfget scan <org/model> [options]
+                       per-file verdicts from HuggingFace's malware and pickle
+                       scanners, plus each file's format, without downloading
+                       anything. Accepts -r/-i/-x/-t like 'download'.
+                       Exit code 2 when something is flagged.
+  hfget audit [base-dir] [--offline]
+                       one table of every managed model under the base dir:
+                       size, when it was fetched, the filter it was fetched
+                       with, which weight formats are on disk (pickle-format
+                       files are called out) and the current scanner verdict.
+                       --offline skips the verdict refresh and shows what was
+                       recorded when the model was fetched.
 
 Queue (state in ~/.hfget):
   hfget add <model...> [download options]
@@ -123,6 +142,19 @@ Other:
   -h, --help           this help
   -V, --version        print version
 
+Safety:
+  hfget never runs anything it downloads. Before fetching (download, add and
+  update alike) it asks HuggingFace's malware and pickle scanners about the
+  repo and refuses files they flagged unless you pass --allow-unsafe; 'add'
+  rejects such a model instead of queueing it, and 'update' re-checks, so a
+  repo that turned bad after you first fetched it is caught too.
+  Pickle-format files (.bin .pt .pth .ckpt .pkl) can run code when a program
+  loads them; prefer .safetensors or .gguf whenever the author offers them.
+
+Exit codes:
+  0 success · 1 error or aborted · 2 refused: flagged by the scanners ·
+  130 interrupted
+
 Environment:
   HFGET_DEST           default download dir (e.g. "$HOME/models")
   HF_NAS_DIR           legacy alias for HFGET_DEST (still honored)
@@ -139,6 +171,8 @@ Environment:
   HFGET_NOCAFFEINE     if set, do not re-exec under caffeinate (macOS)
   HFGET_NO_MANIFEST    if set, do not write the per-model .hfget/manifest.tsv
                        (disables the exact/cheap 'update' and 'outdated' checks)
+  HFGET_SCAN           set to "off" to skip the scanner check entirely
+                       (e.g. offline mirrors); default: on
 
 Examples:
   export HFGET_DEST="$HOME/models"                 # e.g. in ~/.zshrc / ~/.bashrc
@@ -149,6 +183,8 @@ Examples:
   hfget update Qwen/Qwen3-8B                        # re-fetch only what changed
   hfget outdated                                    # which models have updates?
   hfget update --all                                # refresh the whole archive
+  hfget scan InstantX/InstantID                     # safe to load? which formats?
+  hfget audit                                       # what's on disk, and is it safe?
 EOF
 }
 
@@ -295,10 +331,18 @@ fetch_tree() {
   # When WANT_OIDS=1 (update/manifest paths) also capture, per file, the git
   # blob oid and lfs sha into OIDS_TSV, and the repo's commit sha from the
   # response headers — none of which `download` needs by itself.
-  local want_oids=${WANT_OIDS:-0}
+  local want_oids=${WANT_OIDS:-0} want_scan=${WANT_SCAN:-0}
   REPO_COMMIT=''
   if [[ $want_oids -eq 1 ]]; then OIDS_TSV="$TMPD/oids.tsv"; : > "$OIDS_TSV"; fi
+  # WANT_SCAN=1 ('scan' command): ask for the expanded tree, which carries each
+  # file's security-scanner verdict, into SCAN_TSV (path \t verdict \t
+  # pickle-scan \t dangerous imports). Expanded pages are smaller (50 files),
+  # so the plain tree is used everywhere else.
   local url="$HF/api/models/$MODEL/tree/$REV_ENC?recursive=true" pages=0
+  if [[ $want_scan -eq 1 ]]; then
+    SCAN_TSV="$TMPD/scan.tsv"; : > "$SCAN_TSV"
+    url="$url&expand=true"
+  fi
   while [[ -n $url ]]; do
     api_get "$url"
     jq -r '.[] | select(.type == "file") | [(.size | numbers // 0), (.lfs.oid // "-"), .path] | @tsv' \
@@ -306,6 +350,16 @@ fetch_tree() {
     if [[ $want_oids -eq 1 ]]; then
       jq -r '.[] | select(.type == "file") | [.path, (.oid // "-"), (.lfs.oid // "-")] | @tsv' \
         "$TMPD/body" >> "$OIDS_TSV"
+    fi
+    if [[ $want_scan -eq 1 ]]; then
+      # Verdict strings are untrusted and end up on the TTY: strip control chars.
+      jq -r '.[] | select(.type == "file") | [
+                .path,
+                (.securityFileStatus.status // "unscanned"),
+                (.securityFileStatus.pickleImportScan.status // "-"),
+                ([.securityFileStatus.pickleImportScan.pickleImports[]?
+                    | select(.safety != "innocuous") | "\(.module).\(.name)"] | join(",") | if . == "" then "-" else . end)
+              ] | @tsv' "$TMPD/body" 2>/dev/null | LC_ALL=C tr -d '\000-\010\013-\037\177' >> "$SCAN_TSV" || true
     fi
     url=$NEXT_URL
     pages=$((pages + 1))
@@ -399,13 +453,159 @@ size_guard() {
   fi
 }
 
+# ---------------------------------------------------------- content safety --
+# Two independent signals about what a file IS (not just how big it is):
+#  1. its format — pickle-based formats execute code when a program loads
+#     them; safetensors/gguf/onnx cannot. Judged by extension, and for files
+#     on disk by their first bytes ('audit'), so a mislabeled pickle can't hide.
+#  2. HuggingFace's own malware/pickle scanners — per repo (one small call,
+#     used as a gate before every fetch) or per file ('hfget scan').
+
+# Format classes, as one awk function shared by every table and summary.
+#   pickle : Python-pickle based, runs code on load (.bin .pt .pth .ckpt ...)
+#   keras  : HDF5/Keras archives, may embed code
+#   code   : source files (run only if a loader opts in, e.g. trust_remote_code)
+#   safe   : weight/data formats that cannot carry code
+#   other  : configs, docs, images, ...
+# fmt_key() is the display key: the class, or the extension for 'safe' files.
+AWK_FMT='function fmt_class(p,  e) {
+  e = p; sub(/^.*\//, "", e)
+  if (e !~ /\./) return "other"
+  sub(/^.*\./, "", e); e = tolower(e)
+  if (e ~ /^(bin|pt|pth|pkl|pickle|ckpt|joblib|nemo)$/) return "pickle"
+  if (e ~ /^(h5|hdf5|keras)$/) return "keras"
+  if (e ~ /^(py|sh|ipynb)$/) return "code"
+  if (e ~ /^(safetensors|gguf|ggml|onnx|msgpack|tflite|mlmodel|mlpackage|npy|npz)$/) return "safe"
+  return "other"
+}
+function fmt_key(p,  c, e) {
+  c = fmt_class(p)
+  if (c != "safe") return c
+  e = p; sub(/^.*\./, "", e); return tolower(e)
+}'
+fmt_class() { awk "$AWK_FMT"'BEGIN { print fmt_class(ARGV[1]); exit }' "$1"; }
+
+# One-line format summary of a TSV: "safetensors ×3 · pickle ×1 (.bin)".
+# $2 = path column; $3 (optional) = a column holding a precomputed fmt_key
+# (audit uses this after sniffing the bytes on disk). 'other' is not listed.
+fmt_summary() {
+  local tsv=$1 pc=$2 kc=${3:-0}
+  awk -F '\t' -v pc="$pc" -v kc="$kc" "$AWK_FMT"'
+    { p = $pc; k = (kc > 0) ? $kc : fmt_key(p)
+      if (k == "other") next
+      n[k]++
+      if (k == "pickle" || k == "keras" || k == "code") {
+        e = p; sub(/^.*\./, "", e); e = "." tolower(e)
+        if (!index(x[k], e)) x[k] = x[k] (x[k] ? ", " : "") e
+      }
+    }
+    END { for (k in n) printf "%d\t%d\t%s\t%s\n", (k == "pickle" || k == "keras" || k == "code") ? 0 : 1, n[k], k, (k in x ? " (" x[k] ")" : "") }' "$tsv" \
+    | sort -t$'\t' -k1,1n -k2,2nr -k3,3 \
+    | awk -F '\t' '{ s = $3 " ×" $2 $4; out = out (out ? " · " : "") s } END { print (out ? out : "(no weight files)") }'
+}
+
+# What a file on disk actually is, from its first 512 bytes (cheap even over
+# SMB; no xxd needed). Prints one of:
+#   gguf | safetensors | torch-zip | pickle | zip | tar | other
+# A torch zip (.pt/.ckpt/most .bin) is a zip whose first member is data.pkl.
+sniff_format() {
+  local hex
+  hex=$(head -c 512 "$1" 2>/dev/null | od -An -tx1 -v | tr -d ' \n')
+  case "$hex" in
+    47475546*) echo gguf; return 0 ;;                                            # "GGUF"
+    504b0304*) case "$hex" in *646174612e706b6c*) echo torch-zip ;; *) echo zip ;; esac; return 0 ;;  # "PK\3\4" (+ "data.pkl")
+    800[2-5]*) echo pickle; return 0 ;;                                          # pickle protocol 2-5
+  esac
+  if [[ ${hex:16:2} == 7b && ${hex:8:8} == 00000000 ]]; then echo safetensors   # u64 header length, then "{"
+  elif [[ ${hex:514:10} == 7573746172 ]]; then echo tar                          # "ustar" at offset 257
+  else echo other; fi
+}
+
+# Repo-level verdict of HuggingFace's scanners: one small call to
+# /api/models/<id>/scan. Sets SCAN_DONE (1 = every file scanned, 0 = still in
+# progress, '' = unknown), SCAN_ISSUES (TSV of flagged files: path \t level)
+# and SCAN_REPO (flagged | clear | partial | unknown). Never dies — it runs
+# inside the multi-model loops of add/update/audit. Cached per id for the run.
+SCAN_FOR=''
+scan_status() {
+  local id=$1 code
+  if [[ $SCAN_FOR == "$id" ]]; then return 0; fi
+  SCAN_FOR=$id; SCAN_DONE=''; SCAN_REPO=unknown
+  SCAN_ISSUES="$TMPD/scan_issues"; : > "$SCAN_ISSUES"
+  [[ ${HFGET_SCAN:-on} != off ]] || return 0
+  code=$(curl -sS -H @"$HDRS" -o "$TMPD/scan" -w '%{http_code}' \
+              --connect-timeout 15 --max-time 60 "$HF/api/models/$id/scan" </dev/null 2>/dev/null || echo 000)
+  [[ $code == 200 ]] || return 0
+  SCAN_DONE=$(jq -r 'if .scansDone == true then "1" elif .scansDone == false then "0" else "" end' "$TMPD/scan" 2>/dev/null || echo '')
+  # Paths and levels are untrusted and get printed: strip control chars (keep tabs).
+  jq -r '.filesWithIssues[]? | [.path, (.level // "flagged")] | @tsv' "$TMPD/scan" 2>/dev/null \
+    | LC_ALL=C tr -d '\000-\010\013-\037\177' > "$SCAN_ISSUES" || : > "$SCAN_ISSUES"
+  if [[ -s $SCAN_ISSUES ]]; then SCAN_REPO=flagged
+  elif [[ $SCAN_DONE == 1 ]]; then SCAN_REPO=clear
+  elif [[ $SCAN_DONE == 0 ]]; then SCAN_REPO=partial
+  fi
+}
+
+# Which of the files in TSV $1 (path in column $2) are flagged → $TMPD/flagged
+# (path \t level); sets N_FLAG. Then SCAN_STATE — the verdict for THAT set of
+# files, as recorded in the manifest: flagged, else clear/partial by whether
+# HuggingFace finished scanning the repo, else unknown.
+scan_state_for() {
+  local tsv=$1 pc=$2
+  : > "$TMPD/flagged"
+  if [[ -s ${SCAN_ISSUES:-/nonexistent} ]]; then   # (awk's FNR==NR idiom needs a non-empty first file)
+    awk -F '\t' -v pc="$pc" 'FNR == NR { lvl[$1] = $2; next } ($pc in lvl) { print $pc "\t" lvl[$pc] }' \
+      "$SCAN_ISSUES" "$tsv" > "$TMPD/flagged"
+  fi
+  N_FLAG=$(nrows "$TMPD/flagged")
+  if [[ $N_FLAG -gt 0 ]]; then SCAN_STATE=flagged
+  elif [[ ${SCAN_DONE:-} == 1 ]]; then SCAN_STATE=clear
+  elif [[ ${SCAN_DONE:-} == 0 ]]; then SCAN_STATE=partial
+  else SCAN_STATE=unknown; fi
+}
+
+# The gate, run in pre-flight before anything touches the disk. $1 = TSV of
+# what is about to be fetched, $2 = verb for messages, $3 = its path column.
+# Prints the "safety:" pre-flight line, sets SCAN_STATE (for the manifest) and
+# returns 2 — refuse — when a flagged file is selected and --allow-unsafe was
+# not given. Fails open (warn + proceed) when the status can't be read: the
+# tree call just succeeded, so that is an API hiccup, not a bad repo.
+scan_gate() {
+  local sel=$1 verb=$2 pc=$3 n_pickle
+  SCAN_STATE=unknown
+  [[ ${HFGET_SCAN:-on} != off ]] || return 0
+  scan_status "$MODEL"
+  scan_state_for "$sel" "$pc"
+  n_pickle=$(awk -F '\t' -v pc="$pc" "$AWK_FMT"'fmt_class($pc) == "pickle" || fmt_class($pc) == "keras" { n++ } END { print n + 0 }' "$sel")
+  if [[ $N_FLAG -gt 0 ]]; then
+    warn "safety:       $N_FLAG file(s) FLAGGED by HuggingFace's malware/pickle scanners:"
+    awk -F '\t' '{ printf "                - %s  (%s)\n", $1, $2 }' "$TMPD/flagged" >&2
+    if [[ $ALLOW_UNSAFE -eq 1 ]]; then
+      warn "              --allow-unsafe given — continuing at your own risk (details: hfget scan $MODEL)"
+      return 0
+    fi
+    warn "              refusing to $verb. Details: hfget scan $MODEL — if you understand the risk, rerun with --allow-unsafe"
+    return 2
+  fi
+  case "$SCAN_REPO" in
+    clear)   info "safety:       HuggingFace's scanners found no issues in this repo" ;;
+    partial) info "safety:       no issues found so far (HuggingFace has not finished scanning this repo)" ;;
+    flagged) info "safety:       $(nrows "$SCAN_ISSUES") flagged file(s) in this repo are not among the files to fetch — those are clear" ;;
+    *)       warn "safety:       could not read HuggingFace's scan status — continuing (HFGET_SCAN=off silences this)" ;;
+  esac
+  if [[ $n_pickle -gt 0 ]]; then
+    info "              ${C_DIM}$n_pickle file(s) in a format that can run code when loaded (pickle .bin/.pt/.ckpt, Keras .h5) — prefer .safetensors/.gguf when the author offers them${C_OFF}"
+  fi
+  return 0
+}
+
 # ===========================================================================
 #  download command
 # ===========================================================================
 cmd_download() {
 
 MODEL='' BASE='' REV='main' TOKEN=''
-LIST=0 DRYRUN=0 JOBS=1 VERIFY=0 REQUIRE_MOUNT=0
+LIST=0 DRYRUN=0 JOBS=1 VERIFY=0 REQUIRE_MOUNT=0 ALLOW_UNSAFE=0
 INCLUDES=() EXCLUDES=()
 
 need_val() { [[ $# -ge 2 ]] || die "option $1 requires a value"; }
@@ -423,6 +623,7 @@ while [[ $# -gt 0 ]]; do
     -j|--jobs)      need_val "$@"; JOBS=$2; shift 2 ;;
     --verify)       VERIFY=1; shift ;;
     --require-mount) REQUIRE_MOUNT=1; shift ;;
+    --allow-unsafe) ALLOW_UNSAFE=1; shift ;;
     --force-local)  shift ;;   # deprecated: local is now the default (accepted, no-op)
     -y|--yes)       YES=1; shift ;;
     -V|--version)   echo "hfget $VERSION"; exit 0 ;;
@@ -475,14 +676,20 @@ apply_filters
 # ------------------------------------------------------------------- --list --
 if [[ $LIST -eq 1 ]]; then
   n=0; total=0
+  # Mark files HuggingFace's scanners flagged with "!" (one cheap repo call).
+  scan_status "$MODEL"
+  scan_state_for "$SEL_TSV" 3
   while IFS=$'\t' read -r size lfs path; do
     marker=' '
     if [[ $lfs != "-" ]]; then marker='L'; fi
+    if [[ $N_FLAG -gt 0 ]] && cut -f1 "$TMPD/flagged" | grep -qxF -- "$path"; then marker='!'; fi
     printf '%10s %s %s\n' "$(human "$size")" "$marker" "$path"
     n=$((n + 1)); total=$((total + size))
   done < "$SEL_TSV"
   echo "-----"
-  printf '%10s   %d files  (L = large file stored in LFS)\n' "$(human "$total")" "$n"
+  printf '%10s   %d files  (L = large file stored in LFS' "$(human "$total")" "$n"
+  if [[ $N_FLAG -gt 0 ]]; then printf ', ! = FLAGGED by HuggingFace'"'"'s security scanners'; fi
+  printf ')\n'
   exit 0
 fi
 
@@ -548,6 +755,17 @@ overview_tsv "$SEL_TSV"
 if [[ $n_work -eq 0 ]]; then
   info "${C_GRN}nothing to do — all files are already complete at the destination${C_OFF}"
   exit 0
+fi
+
+# Ask HuggingFace's scanners about what we are about to fetch; a flagged file
+# means exit 2 here, before the destination even exists (--allow-unsafe overrides).
+scan_gate "$WORK_TSV" download 4 || exit $?
+# Files already present count for the manifest's recorded verdict too.
+if [[ ${HFGET_SCAN:-on} != off ]]; then
+  scan_state_for "$SEL_TSV" 3
+  if [[ $N_FLAG -gt 0 && $ALLOW_UNSAFE -eq 0 ]]; then
+    warn "              $N_FLAG flagged file(s) are already at the destination — details: hfget scan $MODEL"
+  fi
 fi
 
 # Cheap auth probe: gated repos serve their file list publicly and only reject
@@ -764,8 +982,10 @@ cmd_add() {
   [[ ${#models[@]} -gt 0 ]] || die "usage: hfget add <model...> [download options]"
 
   # Mirror the filter/revision/token flags so the pre-queue preview matches
-  # what the download will actually select.
+  # what the download will actually select. --allow-unsafe is mirrored too:
+  # the scanner gate runs here, and the flag rides along in the stored entry.
   local prev_rev='' i=0 nsh=${#shared[@]}
+  ALLOW_UNSAFE=0
   while [[ $i -lt $nsh ]]; do
     a=${shared[$i]}
     case "$a" in
@@ -773,6 +993,7 @@ cmd_add() {
       -x|--exclude)  i=$((i + 1)); if [[ $i -lt $nsh ]]; then EXCLUDES+=("${shared[$i]}"); fi ;;
       -r|--revision) i=$((i + 1)); if [[ $i -lt $nsh ]]; then prev_rev=${shared[$i]}; fi ;;
       -t|--token)    i=$((i + 1)); if [[ $i -lt $nsh ]]; then TOKEN=${shared[$i]}; fi ;;
+      --allow-unsafe) ALLOW_UNSAFE=1 ;;
     esac
     i=$((i + 1))
   done
@@ -849,6 +1070,12 @@ cmd_add() {
     count=$(awk 'END { print NR }' "$SEL_TSV")
     info "$m: $count files, $(human "$total") total"
     overview_tsv "$SEL_TSV"
+    # Like gated repos: a model the scanners flagged is rejected here, never
+    # queued (the runner's child re-checks with the stored --allow-unsafe).
+    if ! scan_gate "$SEL_TSV" queue 3; then
+      info "skipped $m"
+      continue
+    fi
     if ! size_guard "$total" "queue"; then
       info "skipped $m"
       continue
@@ -1358,15 +1585,20 @@ read_manifest_rows() {
   grep -v '^#' "$mf" 2>/dev/null || true
 }
 
-# Parse a manifest's header into MANIFEST_REV / MANIFEST_COMMIT (empty if none).
+# Parse a manifest's header into MANIFEST_REV / MANIFEST_COMMIT / MANIFEST_UPDATED
+# / MANIFEST_SCAN (each empty if absent; SCAN is the scanner verdict recorded
+# for the files hfget put there: flagged | clear | partial | unknown).
 read_manifest_header() {
   local mf hdr g; mf=$(manifest_file "$1")
-  MANIFEST_REV=''; MANIFEST_COMMIT=''; MANIFEST_INCLUDES=(); MANIFEST_EXCLUDES=()
+  MANIFEST_REV=''; MANIFEST_COMMIT=''; MANIFEST_UPDATED=''; MANIFEST_SCAN=''
+  MANIFEST_INCLUDES=(); MANIFEST_EXCLUDES=()
   [[ -f $mf ]] || return 1
   hdr=$(grep -m1 '^# hfget ' "$mf" 2>/dev/null || true)
   [[ -n $hdr ]] || return 1
   MANIFEST_REV=$(printf '%s\n' "$hdr" | sed -n 's/.*[[:space:]]rev=\([^[:space:]]*\).*/\1/p')
   MANIFEST_COMMIT=$(printf '%s\n' "$hdr" | sed -n 's/.*[[:space:]]commit=\([^[:space:]]*\).*/\1/p')
+  MANIFEST_UPDATED=$(printf '%s\n' "$hdr" | sed -n 's/.*[[:space:]]updated=\([^[:space:]]*\).*/\1/p')
+  MANIFEST_SCAN=$(printf '%s\n' "$hdr" | sed -n 's/.*[[:space:]]scan=\([^[:space:]]*\).*/\1/p')
   # Recorded per-model filter (globs the user downloaded with), one per line.
   while IFS=$'\t' read -r _ g; do
     if [[ -n $g ]]; then MANIFEST_INCLUDES+=("$g"); fi
@@ -1395,7 +1627,9 @@ write_manifest() {
   mf="$mdir/manifest.tsv"; mtmp="$mf.tmp.$$"
   ts=$(date -u +%FT%TZ)
   {
-    printf '# hfget %s rev=%s commit=%s updated=%s\n' "$VERSION" "$REV" "${REPO_COMMIT:-}" "$ts"
+    # scan= is the scanner verdict for these files at the time of writing, so
+    # 'audit --offline' can show it and 'update' can tell "was clear, now flagged".
+    printf '# hfget %s rev=%s commit=%s updated=%s scan=%s\n' "$VERSION" "$REV" "${REPO_COMMIT:-}" "$ts" "${SCAN_STATE:-unknown}"
     # Remember the filter this model was downloaded with, so a later 'update'
     # (or 'update --all') stays pinned to the same subset (e.g. one GGUF quant)
     # instead of expanding to the whole repo.
@@ -1470,12 +1704,13 @@ synth_manifest_by_hash() {
   done < "$TREE4"
 }
 
-# Print "org/model" for every managed model under a base dir (dirs carrying a
-# .hfget/manifest.tsv). Layout is <base>/<org>/<model>/.
+# Print the id of every managed model under a base dir (dirs carrying a
+# .hfget/manifest.tsv). Layout is <base>/<org>/<model>/, or <base>/<model>/ for
+# the bare ids of canonical models (e.g. gpt2).
 discover_models() {
   local base=$1 g id
   [[ -d $base ]] || return 0
-  for g in "$base"/*/*/"$MANIFEST_REL"; do
+  for g in "$base"/*/"$MANIFEST_REL" "$base"/*/*/"$MANIFEST_REL"; do
     [[ -f $g ]] || continue
     id=${g#"$base"/}
     id=${id%/"$MANIFEST_REL"}
@@ -1600,7 +1835,8 @@ update_one() {
     INCLUDES=(${MANIFEST_INCLUDES[@]+"${MANIFEST_INCLUDES[@]}"})
     EXCLUDES=(${MANIFEST_EXCLUDES[@]+"${MANIFEST_EXCLUDES[@]}"})
     if [[ ${#INCLUDES[@]} -gt 0 || ${#EXCLUDES[@]} -gt 0 ]]; then
-      info "  ${C_DIM}(keeping this model's recorded filter: ${INCLUDES[*]}${EXCLUDES[*]:+ ! ${EXCLUDES[*]}})${C_OFF}"
+      # (both arrays guarded: bash 3.2 + set -u errors on a bare empty array)
+      info "  ${C_DIM}(keeping this model's recorded filter: ${INCLUDES[*]+${INCLUDES[*]}}${EXCLUDES[*]+ ! ${EXCLUDES[*]}})${C_OFF}"
     fi
   fi
 
@@ -1713,6 +1949,29 @@ update_one() {
   fi
   info "  to fetch:   $(human "$need_bytes")"
 
+  # Scanner verdict. Files already here are re-checked every time (a repo can
+  # turn bad after you fetched it, and the scanners keep learning); what we are
+  # about to fetch goes through the same gate as 'download'. Either way the
+  # manifest records the verdict for the files that end up on disk.
+  SCAN_STATE=unknown
+  if [[ ${HFGET_SCAN:-on} != off ]]; then
+    scan_status "$MODEL"
+    scan_state_for "$CLS_UNCH" 1
+    if [[ $N_FLAG -gt 0 ]]; then
+      warn "$MODEL: HuggingFace's scanners now flag $N_FLAG file(s) that are already on disk:"
+      awk -F '\t' '{ printf "  - %s  (%s)\n", $1, $2 }' "$TMPD/flagged" >&2
+      case "${MANIFEST_SCAN:-}" in
+        clear|partial) warn "  this repo was clear when you fetched it${MANIFEST_UPDATED:+ on ${MANIFEST_UPDATED%%T*}}" ;;
+      esac
+      warn "  consider removing them; details: hfget scan $MODEL"
+    fi
+    if [[ $n_work -gt 0 ]]; then
+      local on_disk_state=$SCAN_STATE
+      scan_gate "$WORK_TSV" update 4 || { warn "$MODEL: skipped — nothing changed"; return 1; }
+      if [[ $on_disk_state == flagged ]]; then SCAN_STATE=flagged; fi
+    fi
+  fi
+
   if [[ $n_work -eq 0 && $n_ren -eq 0 && $n_stale -eq 0 ]]; then
     info "${C_GRN}up to date${C_OFF}${REPO_COMMIT:+ (commit ${REPO_COMMIT:0:12})}"
     # Refresh the manifest (records/updates the revision) — but never under
@@ -1819,7 +2078,7 @@ update_one() {
 
 cmd_update() {
   MODEL='' BASE='' TOKEN='' REV='' REV_ARG='' REV_FORCED=0
-  JOBS=1 VERIFY=0 REQUIRE_MOUNT=0 DRYRUN=0
+  JOBS=1 VERIFY=0 REQUIRE_MOUNT=0 DRYRUN=0 ALLOW_UNSAFE=0
   INCLUDES=() EXCLUDES=()
   local do_all=0 rehash=0 stale_mode=ask a
   local models=() realmodels=()
@@ -1842,6 +2101,7 @@ cmd_update() {
       --keep)          stale_mode=keep; shift ;;
       --backup)        stale_mode=backup; shift ;;
       --require-mount) REQUIRE_MOUNT=1; shift ;;
+      --allow-unsafe)  ALLOW_UNSAFE=1; shift ;;
       -n|--dry-run)    DRYRUN=1; shift ;;
       -y|--yes)        YES=1; shift ;;
       -h|--help)       usage; exit 0 ;;
@@ -1958,6 +2218,214 @@ cmd_outdated() {
     info "checked $n model(s): ${upd} with updates, $((n - upd - unknown)) up to date${unchecked_note}"
     if [[ $upd -gt 0 ]]; then info "refresh them with: hfget update --all $BASE   (or: hfget update <org/model>)"; fi
   fi
+}
+
+# ===========================================================================
+#  scan / audit  — is it safe to load?
+# ===========================================================================
+
+# Per-file verdicts of HuggingFace's scanners plus each file's format, for a
+# repo you have not (necessarily) downloaded. Nothing is fetched. Exit 2 when
+# anything is flagged, so scripts can gate on it.
+cmd_scan() {
+  MODEL='' REV='main' TOKEN=''
+  INCLUDES=() EXCLUDES=()
+  need_val() { [[ $# -ge 2 ]] || die "option $1 requires a value"; }
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -r|--revision) need_val "$@"; REV=$2; shift 2 ;;
+      -i|--include)  need_val "$@"; INCLUDES+=("$2"); shift 2 ;;
+      -x|--exclude)  need_val "$@"; EXCLUDES+=("$2"); shift 2 ;;
+      -t|--token)    need_val "$@"; TOKEN=$2
+                     warn "a token passed via -t is visible in 'ps' and shell history; prefer \$HF_TOKEN or the hf token file"
+                     shift 2 ;;
+      -h|--help)     usage; exit 0 ;;
+      -*)            die "unknown option: $1 (see --help)" ;;
+      *)             [[ -z $MODEL ]] || die "unexpected argument: $1"; MODEL=$1; shift ;;
+    esac
+  done
+  [[ -n $MODEL ]] || die "usage: hfget scan <org/model> [-r rev] [-i glob] [-x glob]"
+  normalize_model_id "$MODEL"; MODEL=$NORM_MODEL
+  if [[ -n $NORM_UREV && $REV == main ]]; then REV=$NORM_UREV; fi
+  [[ $MODEL =~ $MODEL_ID_RE ]] || die "'$MODEL' does not look like a HuggingFace model id (expected: org/model)"
+  case "/$MODEL/" in */../*) die "invalid model id '$MODEL' (contains '..')" ;; esac
+
+  resolve_token
+  setup_net
+  info "${C_DIM}fetching file list + scanner verdicts: $MODEL @ $REV${C_OFF}"
+  WANT_SCAN=1
+  fetch_tree
+  apply_filters
+  [[ -s $SEL_TSV ]] || die "no files match the given --include/--exclude filters"
+
+  # selection (size lfs path) ⋈ verdicts (path status pickle imports), plus the
+  # format key → rows: size \t path \t status \t pickle-scan \t imports \t key
+  local rows="$TMPD/scanrows"
+  if [[ -s $SCAN_TSV ]]; then
+    awk -F '\t' "$AWK_FMT"'
+      FNR == NR { st[$1] = $2; ps[$1] = $3; im[$1] = $4; next }
+      { p = $3
+        print $1 "\t" p "\t" (p in st ? st[p] : "unscanned") "\t" (p in ps ? ps[p] : "-") "\t" (p in im ? im[p] : "-") "\t" fmt_key(p) }' \
+      "$SCAN_TSV" "$SEL_TSV" > "$rows"
+  else
+    awk -F '\t' "$AWK_FMT"'{ print $1 "\t" $3 "\tunscanned\t-\t-\t" fmt_key($3) }' "$SEL_TSV" > "$rows"
+  fi
+
+  local size path st im key fmt verdict note n=0 total=0 n_safe=0 n_flag=0 n_pend=0 n_pickle=0
+  printf '%10s  %-12s %-10s %s\n' "size" "format" "verdict" "file"
+  while IFS=$'\t' read -r size path st _ im key; do
+    n=$((n + 1)); total=$((total + size))
+    case "$key" in
+      pickle) fmt="pickle"; n_pickle=$((n_pickle + 1)) ;;
+      keras)  fmt="keras/h5"; n_pickle=$((n_pickle + 1)) ;;
+      code)   fmt="code" ;;
+      other)  fmt="-" ;;
+      *)      fmt=$key ;;
+    esac
+    note=''
+    case "$st" in
+      safe)                                  verdict="safe"; n_safe=$((n_safe + 1)) ;;
+      unsafe|suspicious|malicious|dangerous) verdict="FLAGGED:$st"; n_flag=$((n_flag + 1))
+                                             if [[ $im != "-" ]]; then note="   ← pickle imports: $im"; fi ;;
+      queued|unscanned|'')                   verdict="pending"; n_pend=$((n_pend + 1)) ;;
+      *)                                     verdict=$st; n_pend=$((n_pend + 1)) ;;
+    esac
+    printf '%10s  %-12s %-10s %s%s\n' "$(human "$size")" "$fmt" "$verdict" "$path" "$note"
+  done < "$rows"
+  echo "-----"
+  printf '%10s  %d files: %d safe, %d flagged, %d not yet scanned\n' "$(human "$total")" "$n" "$n_safe" "$n_flag" "$n_pend"
+  info ""
+  if [[ $n_flag -gt 0 ]]; then
+    warn "$n_flag file(s) FLAGGED by HuggingFace's malware/pickle scanners — hfget refuses to fetch them unless you pass --allow-unsafe"
+  fi
+  if [[ $n_pickle -gt 0 ]]; then
+    info "$n_pickle file(s) in a format that can run code when loaded (pickle .bin/.pt/.ckpt, Keras .h5) — only use them from authors you trust, and prefer .safetensors/.gguf when the author offers them"
+  fi
+  info "${C_DIM}scanner reports: $HF/$MODEL/tree/$REV${C_OFF}"
+  [[ $n_flag -eq 0 ]] || exit 2
+  exit 0
+}
+
+# One table of every managed model under a base dir: size, when it was
+# fetched, the filter it was fetched with, which weight formats are really on
+# disk (by sniffing bytes, not trusting names) and the scanners' verdict —
+# refreshed with one call per model, or, with --offline, as recorded at fetch
+# time. Exit 2 if anything is flagged or a hidden pickle turns up.
+cmd_audit() {
+  BASE='' TOKEN=''
+  local a offline=0
+  need_val() { [[ $# -ge 2 ]] || die "option $1 requires a value"; }
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --offline)  offline=1; shift ;;
+      -t|--token) need_val "$@"; TOKEN=$2; shift 2 ;;
+      -h|--help)  usage; exit 0 ;;
+      -*)         die "unknown option: $1 (see --help)" ;;
+      *)          [[ -z $BASE ]] || die "unexpected argument: $1"; BASE=$1; shift ;;
+    esac
+  done
+  if [[ -z $BASE ]]; then BASE=${HFGET_DEST:-${HF_NAS_DIR:-}}; fi
+  [[ -n $BASE ]] || die "no base dir: pass one as an argument, or set HFGET_DEST"
+  [[ -d $BASE ]] || die "not a directory: $BASE"
+  if [[ ${HFGET_SCAN:-on} == off ]]; then offline=1; fi
+
+  resolve_token
+  setup_net
+
+  if [[ $offline -eq 1 ]]; then info "${C_DIM}auditing managed models under $BASE (offline: verdicts as recorded at fetch time) …${C_OFF}"
+  else info "${C_DIM}auditing managed models under $BASE …${C_OFF}"; fi
+  info ""
+  # One model per row (id, size, fetched, files, verdict) plus an indented
+  # line with what is on disk and why (formats, filter, revision).
+  printf '%-42s %9s  %-10s %5s  %s\n' "model" "size" "fetched" "files" "HF scan"
+
+  local id dest rows keyed path size key sniff fetched formats verdict extra
+  local n=0 bytes_all=0 n_flag=0 n_pickle=0 n_hidden=0 mbytes nfiles hidden was
+  while IFS= read -r id; do
+    [[ -n $id ]] || continue
+    n=$((n + 1))
+    dest="$BASE/$id"
+    if ! read_manifest_header "$dest"; then
+      printf '%-42s %9s  %-10s %5s  %s\n' "$id" "?" "?" "?" "(unreadable manifest)"
+      continue
+    fi
+    rows="$TMPD/arows"; read_manifest_rows "$dest" > "$rows" 2>/dev/null || : > "$rows"
+    nfiles=$(nrows "$rows"); mbytes=$(bsum "$rows"); bytes_all=$((bytes_all + mbytes))
+    fetched=${MANIFEST_UPDATED%%T*}; [[ -n $fetched ]] || fetched='?'
+
+    # Format keys by name, then corrected by the bytes of every weight-sized
+    # file (≥ 1 MB) actually on disk: a .bin that is really a raw blob is not a
+    # pickle; a "safetensors" that is really a pickle is a hidden one.
+    keyed="$TMPD/akeyed"
+    awk -F '\t' "$AWK_FMT"'{ print $1 "\t" $2 "\t" fmt_key($1) }' "$rows" > "$keyed.0"
+    : > "$keyed"; hidden=''
+    while IFS=$'\t' read -r path size key; do
+      if [[ $size -ge 1000000 && -f "$dest/$path" && ! -L "$dest/$path" ]]; then
+        sniff=$(sniff_format "$dest/$path")
+        case "$sniff" in
+          pickle|torch-zip) if [[ $key != pickle ]]; then hidden="$hidden $path"; fi; key=pickle ;;
+          safetensors|gguf) key=$sniff ;;
+        esac
+      fi
+      printf '%s\t%s\t%s\n' "$path" "$size" "$key" >> "$keyed"
+    done < "$keyed.0"
+    formats=$(fmt_summary "$keyed" 1 3)
+    if grep -q $'\tpickle$' "$keyed" || grep -q $'\tkeras$' "$keyed"; then n_pickle=$((n_pickle + 1)); fi
+    extra=''
+    if [[ ${#MANIFEST_INCLUDES[@]} -gt 0 || ${#MANIFEST_EXCLUDES[@]} -gt 0 ]]; then
+      extra=" · filter ${MANIFEST_INCLUDES[*]+${MANIFEST_INCLUDES[*]}}${MANIFEST_EXCLUDES[*]+ ! ${MANIFEST_EXCLUDES[*]}}"
+    fi
+    if [[ -n ${MANIFEST_REV:-} && $MANIFEST_REV != main ]]; then extra="$extra · rev ${MANIFEST_REV:0:12}"; fi
+
+    if [[ $offline -eq 1 ]]; then
+      verdict="recorded: ${MANIFEST_SCAN:-unknown}"
+      if [[ ${MANIFEST_SCAN:-} == flagged ]]; then n_flag=$((n_flag + 1)); fi
+    else
+      scan_status "$id"
+      scan_state_for "$rows" 1
+      if [[ $N_FLAG -gt 0 ]]; then
+        n_flag=$((n_flag + 1))
+        verdict="FLAGGED: $(awk -F '\t' '{ s = s (s ? ", " : "") $1 " (" $2 ")" } END { print s }' "$TMPD/flagged")"
+        was=''
+        case "${MANIFEST_SCAN:-}" in clear|partial) was=" — was clear on $fetched" ;; esac
+        verdict="$verdict$was"
+      else
+        case "$SCAN_REPO" in
+          clear)   verdict="clear" ;;
+          partial) verdict="clear (scans incomplete)" ;;
+          flagged) verdict="clear ($(nrows "$SCAN_ISSUES") flagged upstream, not on disk)" ;;
+          *)       verdict="unknown" ;;
+        esac
+      fi
+    fi
+    if [[ -n $hidden ]]; then
+      n_hidden=$((n_hidden + 1))
+      verdict="$verdict — HIDDEN PICKLE:$hidden"
+    fi
+    printf '%-42s %9s  %-10s %5s  %s\n' "$id" "$(human "$mbytes")" "$fetched" "$nfiles" "$verdict"
+    printf '    %s%s\n' "$formats" "$extra"
+  done < <(discover_models "$BASE")
+
+  info ""
+  if [[ $n -eq 0 ]]; then
+    info "no hfget-managed models found under $BASE"
+    info "${C_DIM}(download a model, or run 'hfget update <org/model>' once, to create its manifest)${C_OFF}"
+    exit 0
+  fi
+  local summary
+  summary="$n model(s), $(human "$bytes_all")"
+  if [[ $n_pickle -gt 0 ]]; then summary="$summary · $n_pickle contain pickle-format files"; fi
+  if [[ $n_flag -gt 0 ]]; then summary="$summary · ${C_RED}$n_flag FLAGGED${C_OFF}"; fi
+  if [[ $n_hidden -gt 0 ]]; then summary="$summary · ${C_RED}$n_hidden with a hidden pickle${C_OFF}"; fi
+  info "$summary"
+  if [[ $n_pickle -gt 0 ]]; then
+    info "${C_DIM}pickle-format files can run code when a program loads them — only use them from authors you trust; 'hfget scan <org/model>' shows per-file details${C_OFF}"
+  fi
+  if [[ $n_hidden -gt 0 ]]; then
+    warn "a HIDDEN PICKLE is a file whose name says one format but whose bytes are a pickle — treat it as untrusted"
+  fi
+  [[ $n_flag -eq 0 && $n_hidden -eq 0 ]] || exit 2
+  exit 0
 }
 
 # ===========================================================================
@@ -2123,6 +2591,8 @@ case "${1:-}" in
   download)       shift; cmd_download "$@" ;;
   update)         shift; cmd_update "$@" ;;
   outdated)       shift; cmd_outdated "$@" ;;
+  scan)           shift; cmd_scan "$@" ;;
+  audit)          shift; cmd_audit "$@" ;;
   add)            shift; cmd_add "$@" ;;
   queue)          shift; cmd_queue "$@" ;;
   status)         shift; cmd_status "$@" ;;

@@ -4,6 +4,10 @@
 # HFGET_RUN_NETWORK=1 so `bats tests/` stays offline-friendly by default.
 
 TINY="sshleifer/tiny-gpt2"
+# A well-known demonstration of a malicious pickle, flagged "unsafe" by the
+# Hub's scanners. Only ever used to assert that hfget REFUSES it (dry-run);
+# nothing from it is downloaded or executed.
+FLAGGED="ykilcher/totally-harmless-model"
 
 setup() {
   HFGET="${BATS_TEST_DIRNAME}/../hfget"
@@ -121,4 +125,66 @@ teardown() {
   sed 's/commit=[0-9a-f]*/commit=0000000000000000000000000000000000000000/' "$mf" > "$mf.t" && mv "$mf.t" "$mf"
   run "$HFGET" outdated "$DEST"
   [[ "$output" == *"update available"* ]]
+}
+
+@test "update inherits an exclude-only recorded filter without crashing (bash 3.2 set -u guard)" {
+  "$HFGET" download "$TINY" "$DEST" -x '*.h5' -y
+  grep -q $'^# exclude\t\\*.h5$' "$DEST/$TINY/.hfget/manifest.tsv"
+  run "$HFGET" update "$TINY" "$DEST"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"keeping this model's recorded filter"* ]]
+}
+
+# ---------------------------------------------------------------- safety ----
+
+@test "scan lists per-file verdicts and formats for a clean repo (exit 0)" {
+  run "$HFGET" scan "$TINY"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"pytorch_model.bin"* ]]
+  [[ "$output" == *"pickle"* ]]
+  [[ "$output" == *"9 files:"* ]]
+}
+
+@test "scan exits 2 and names the flagged file for a repo the scanners flagged" {
+  run "$HFGET" scan "$FLAGGED"
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"FLAGGED:unsafe"*"pytorch_model.bin"* ]]
+}
+
+@test "download refuses a flagged repo before touching the disk; --allow-unsafe overrides" {
+  run "$HFGET" download "$FLAGGED" "$DEST" --dry-run
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"refusing to download"* ]]
+  [ ! -d "$DEST/ykilcher" ]
+  run "$HFGET" download "$FLAGGED" "$DEST" --dry-run --allow-unsafe
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"--allow-unsafe given"* ]]
+  # excluding the flagged file makes the rest of the repo fetchable
+  run "$HFGET" download "$FLAGGED" "$DEST" --dry-run -x 'pytorch_model.bin'
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"not among the files to fetch"* ]]
+}
+
+@test "--list marks flagged files with !" {
+  run "$HFGET" download "$FLAGGED" --list
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"! pytorch_model.bin"* ]]
+}
+
+@test "add rejects a flagged repo instead of queueing it" {
+  export HFGET_QUEUE_NOSTART=1
+  run "$HFGET" add "$FLAGGED" "$DEST" -y
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"refusing to queue"* ]]
+  [ ! -s "$STATE/queue.tsv" ]
+}
+
+@test "download records the scanner verdict in the manifest, and audit reads the archive" {
+  "$HFGET" download "$TINY" "$DEST" -y
+  grep -q ' scan=' "$DEST/$TINY/.hfget/manifest.tsv"
+  run "$HFGET" audit "$DEST"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"$TINY"* ]]
+  [[ "$output" == *"pickle"* ]]
+  [[ "$output" == *"1 model(s)"* ]]
 }

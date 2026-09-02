@@ -4,6 +4,45 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and the project uses the
 `VERSION` string in the `hfget` script as the source of truth.
 
+## [2.9.0] — 2026-09-02
+
+Is it safe to load? hfget now acts on HuggingFace's malware/pickle scanners.
+
+### Added
+- **Scanner gate before every fetch.** `download`, `add` and `update` ask the
+  Hub's security scanners about the repo (one small call to
+  `/api/models/<id>/scan`) and **refuse to fetch flagged files** — exit code
+  `2`, before the destination directory is created. `add` rejects such a model
+  instead of queueing it (like gated repos); `update` gates only what it would
+  fetch. `--allow-unsafe` overrides with a loud warning and is stored in queue
+  entries like any other option. The check fails open (warn, continue) if the
+  scan status can't be read, and `HFGET_SCAN=off` skips it.
+- **`hfget scan <org/model>`** — per-file verdicts (safe / FLAGGED / pending)
+  with the dangerous pickle imports the scanners found, each file's format
+  class, and a plain-English note on formats that can run code when loaded.
+  Accepts `-r`/`-i`/`-x`/`-t`. Exit `2` when anything is flagged.
+- **`hfget audit [base-dir] [--offline]`** — one table of every managed model:
+  size, when it was fetched, the filter and revision it was fetched with, the
+  weight formats really on disk, and the current verdict (refreshed with one
+  call per model, or as recorded with `--offline`). Formats are judged by the
+  first bytes of each weight file, not its name, so a **hidden pickle** (a
+  `.safetensors`/`.gguf` whose bytes are a pickle) is called out. Exit `2` when
+  anything is flagged.
+- **Verdict provenance in the manifest** (`scan=clear|partial|flagged|unknown`
+  in the header). `update` re-checks files already on disk every run and
+  reports *"this repo was clear when you fetched it on <date>"* when the
+  scanners flag something later.
+- Pre-flight now prints a `safety:` line, and `--list` marks flagged files
+  with `!`.
+- `--help` documents exit codes (`0`, `1`, `2`, `130`).
+
+### Fixed
+- `update` crashed on macOS's bash 3.2 (`INCLUDES[*]: unbound variable`) when
+  a model's recorded filter contained only `-x`/`--exclude` globs.
+- `update --all`, `outdated` and `audit` now also find models with a bare id
+  (e.g. `gpt2`, stored as `<base>/gpt2/`); previously only `<org>/<model>`
+  directories were discovered.
+
 ## [2.8.1] — 2026-08-24
 
 ### Added
