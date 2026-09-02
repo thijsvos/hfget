@@ -260,8 +260,8 @@ shows up in `ps`.
 | Code | Meaning |
 |---|---|
 | `0` | success |
-| `1` | error, or aborted at a confirmation prompt |
-| `2` | refused: a file to fetch is flagged by HuggingFace's scanners (`download`/`update`), or something is flagged (`scan`/`audit`) |
+| `1` | error, aborted at a confirmation prompt, or (`update`) any model failed or was refused |
+| `2` | refused by HuggingFace's scanners: a file to fetch is flagged (`download`), or something is flagged (`scan`/`audit`; `audit` also for a hidden pickle) |
 | `130` | interrupted (Ctrl-C) — partial files are kept and resume |
 
 ## Troubleshooting

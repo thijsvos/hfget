@@ -6,9 +6,12 @@
 # Files are fetched with curl directly into the destination (no local cache),
 # with resume support, retries, glob filters and optional sha256 verification.
 # The queue lets you enqueue N models; a background runner drains them one by
-# one (watch progress with 'hfget queue'). Before anything is fetched, hfget
-# asks HuggingFace's malware/pickle scanners about the repo and refuses files
-# they flagged ('hfget scan' inspects a repo, 'hfget audit' your archive).
+# one (watch progress with 'hfget queue'). Every model keeps a tiny manifest
+# in its own folder, so 'hfget update' re-fetches only what changed upstream
+# and 'hfget outdated' reports which models have one. Before anything is
+# fetched, hfget asks HuggingFace's malware/pickle scanners about the repo and
+# refuses files they flagged ('hfget scan' inspects a repo, 'hfget audit' your
+# archive). Exit codes: 0 ok · 1 error · 2 refused · 130 interrupted.
 #
 # Runs on macOS and Linux. Requires: bash 3.2+, curl, jq, and standard
 # coreutils (awk sed grep stat df ...). 'sha256sum' or 'shasum' is needed only
@@ -25,7 +28,7 @@ HF="https://huggingface.co"
 if [[ -n ${HFGET_STATE_DIR:-} ]]; then QDIR=$HFGET_STATE_DIR
 elif [[ -n ${XDG_STATE_HOME:-} ]]; then QDIR="$XDG_STATE_HOME/hfget"
 else QDIR="$HOME/.hfget"; fi
-# This script's own path (BASH_SOURCE, so it is right when sourced by tests too).
+# This script's own path (BASH_SOURCE, so it is right when sourced by tests).
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 YES=${HFGET_YES:-}   # -y/--yes or HFGET_YES=1 skips all confirmation prompts
 ALLOW_UNSAFE=0       # --allow-unsafe: fetch files the HF scanners flagged anyway
@@ -54,10 +57,14 @@ if [[ -t 2 ]]; then
 else
   C_RED='' C_GRN='' C_YLW='' C_DIM='' C_OFF=''
 fi
+# Diagnostics all go to stderr, so stdout stays parseable (tables, status);
+# die exits 1.
 info() { printf '%s\n' "$*" >&2; }
 warn() { printf '%swarning:%s %s\n' "$C_YLW" "$C_OFF" "$*" >&2; }
 die()  { printf '%serror:%s %s\n' "$C_RED" "$C_OFF" "$*" >&2; exit 1; }
 
+# The full --help text on STDOUT (callers redirect it to stderr on a usage
+# error). The single source of truth for options, env vars and exit codes.
 usage() {
   cat <<'EOF'
 hfget — download HuggingFace models to any directory, with a built-in queue
@@ -72,14 +79,16 @@ Download now (foreground):
   -i, --include GLOB   only download files matching GLOB (repeatable)
   -x, --exclude GLOB   skip files matching GLOB (repeatable, after includes)
   -l, --list           list the repo's files and sizes, then exit
+                       (L = stored in LFS, ! = flagged by the scanners)
   -n, --dry-run        show what would be downloaded, then exit
   -t, --token TOKEN    HF access token for gated/private models
                        (default: $HF_TOKEN, else the hf CLI token file)
-  -j, --jobs N         download N files in parallel (default: 1)
+  -j, --jobs N         download N files in parallel (1-16, default: 1)
       --verify         sha256-check downloaded LFS files against the HF hash
       --require-mount  refuse unless the destination is a network mount
                        (opt-in NAS safety; any dir is allowed by default)
-      --force-local    accepted for compatibility; now a no-op (local is default)
+      --force-local    accepted for compatibility; now a no-op (local is
+                       the default)
       --allow-unsafe   fetch files even if HuggingFace's security scanners
                        flagged them (default: refuse, exit code 2)
   -y, --yes            skip the size-confirmation prompt (never deletes:
@@ -91,33 +100,38 @@ Check before you trust (foreground):
                        scanners, plus each file's format, without downloading
                        anything. Accepts -r/-i/-x/-t like 'download'.
                        Exit code 2 when something is flagged.
-  hfget audit [base-dir] [--offline]
+  hfget audit [base-dir] [--offline] [-t TOKEN]
                        one table of every managed model under the base dir:
                        size, when it was fetched, the filter it was fetched
                        with, which weight formats are on disk (pickle-format
                        files are called out) and the current scanner verdict.
                        --offline skips the verdict refresh and shows what was
-                       recorded when the model was fetched.
+                       recorded when the model was fetched (HFGET_SCAN=off
+                       implies it). Exit code 2 when a model is flagged or a
+                       hidden pickle turns up.
 
-Queue (state in ~/.hfget):
+Queue (state in $HFGET_STATE_DIR, else $XDG_STATE_HOME/hfget, else ~/.hfget):
   hfget add <model...> [download options]
-                       enqueue model(s); trailing options are stored per entry
-                       (e.g. -i '*Q4_K_M*' --verify). Each model is checked
-                       first: you get a size + contents overview and a
-                       confirmation prompt before it is queued (-y skips).
-                       Gated models are caught here instead of failing later.
-                       Starts a background runner unless --no-start is given.
+                       enqueue model(s); options must trail the model ids and
+                       are stored per entry (e.g. -i '*Q4_K_M*' --verify) —
+                       except -t (never written to the state file) and
+                       -y/--no-start (this 'add' only). The base dir is stored
+                       absolute with every entry. Each model is checked first:
+                       size + contents overview and a confirmation prompt
+                       before it is queued (-y skips). Gated models, and models
+                       the scanners flagged, are caught here instead of failing
+                       later. Starts a background runner unless --no-start.
   hfget queue [sec]    live watch of the queue: current download with progress,
                        pending and failed entries; refreshes every SEC seconds
                        (default: 1) until Ctrl-C
   hfget status         the same view as a one-shot snapshot
   hfget rm <n|model>   remove a pending entry by number, or remove a model from
                        BOTH pending and failed by id (dismisses a dead entry)
-  hfget clear [--all|--failed]
+  hfget clear [--all|-a|--failed|-f]
                        remove pending entries; --failed dismisses failed entries
                        only; --all wipes the whole queue (pending + failed +
                        current) and stops the runner
-  hfget retry          re-queue all failed entries
+  hfget retry          re-queue all failed entries and start the runner
   hfget stop [--now]   stop after the current model, or immediately (--now);
                        everything is resumable
   hfget run            process the queue in the foreground
@@ -128,8 +142,10 @@ Keep models current (foreground):
                        re-fetch only the files that changed upstream; unchanged
                        weights are left in place (no delete-and-replace). Files
                        removed upstream are listed and, with your confirmation,
-                       deleted. Mirrors 'download' options (-r/-i/-x/-t/-j
-                       /--verify), plus:
+                       deleted. With no -i/-x, each model keeps the filter
+                       recorded in its manifest (a one-quant download stays
+                       one quant). Mirrors 'download' options (-r/-i/-x/-t/-j,
+                       --verify, --require-mount, --allow-unsafe, -n, -y), plus:
       --all            update every managed model found under the base dir
       --prune          remove stale files without asking
       --keep           never remove stale files (only add/replace)
@@ -137,7 +153,7 @@ Keep models current (foreground):
       --rehash         hash local files to catch same-size changes exactly
                        (useful for the first update of a pre-manifest dir;
                        implies --verify for the files it then fetches)
-  hfget outdated [base-dir]
+  hfget outdated [base-dir] [-t TOKEN]
                        list which managed models under the base dir have an
                        upstream update (one quick check each; no downloads)
 
@@ -155,32 +171,35 @@ Safety:
   loads them; prefer .safetensors or .gguf whenever the author offers them.
 
 Exit codes:
-  0 success · 1 error or aborted · 2 refused: flagged by the scanners ·
-  130 interrupted
+  0 success · 1 error, aborted, or (update) any model failed or was refused
+  2 refused by the scanners — download, scan and audit (audit: hidden pickle
+    too) · 130 interrupted (download/update; Ctrl-C in 'queue' exits 0)
 
 Environment:
   HFGET_DEST           default download dir (e.g. "$HOME/models")
   HF_NAS_DIR           legacy alias for HFGET_DEST (still honored)
   HF_TOKEN             HF access token for gated/private models
   HF_HOME              where the hf CLI keeps its token file ($HF_HOME/token;
-                       default ~/.cache/huggingface) — read when HF_TOKEN is unset
-  HFGET_STATE_DIR      queue state dir (default: $XDG_STATE_HOME/hfget or ~/.hfget)
-  HFGET_QUEUE_NOSTART  if set, 'add' never auto-starts the runner
+                       default ~/.cache/huggingface); read if HF_TOKEN is unset
+  HFGET_STATE_DIR      queue state dir ($XDG_STATE_HOME/hfget, else ~/.hfget)
+  HFGET_QUEUE_NOSTART  if set, 'add' and 'retry' never auto-start the runner
   HFGET_QUEUE_NOWAIT   if set, the runner does not wait for manual downloads
   HFGET_WARN_GB        size in GB above which the confirmation defaults to No
                        (default: 100)
   HFGET_YES            if set, never ask for confirmation (same as -y)
   HFGET_MIN_SPEED      reconnect if a transfer stalls below this many bytes/sec
                        (default 1048576 = 1 MB/s; set 0 to disable self-healing)
-  HFGET_SPEED_TIME     seconds a stall must persist before reconnecting (default 30)
+  HFGET_SPEED_TIME     seconds a stall must persist before reconnecting
+                       (default 30)
   HFGET_NOCAFFEINE     if set, do not re-exec under caffeinate (macOS)
   HFGET_NO_MANIFEST    if set, do not write the per-model .hfget/manifest.tsv
-                       (disables the exact/cheap 'update' and 'outdated' checks)
+                       (such a model is invisible to 'update --all', 'outdated'
+                       and 'audit'; 'update' then diffs by size, never prunes)
   HFGET_SCAN           set to "off" to skip the scanner check entirely
                        (e.g. offline mirrors); default: on
 
 Examples:
-  export HFGET_DEST="$HOME/models"                 # e.g. in ~/.zshrc / ~/.bashrc
+  export HFGET_DEST="$HOME/models"                  # in ~/.zshrc or ~/.bashrc
   hfget download Qwen/Qwen3-8B
   hfget add Qwen/Qwen3-8B mistralai/Mistral-7B-Instruct-v0.3 --verify
   hfget add bartowski/Llama-3.3-70B-Instruct-GGUF -i '*Q4_K_M*'
@@ -188,8 +207,8 @@ Examples:
   hfget update Qwen/Qwen3-8B                        # re-fetch only what changed
   hfget outdated                                    # which models have updates?
   hfget update --all                                # refresh the whole archive
-  hfget scan InstantX/InstantID                     # safe to load? which formats?
-  hfget audit                                       # what's on disk, and is it safe?
+  hfget scan InstantX/InstantID                     # safe to load? formats?
+  hfget audit                                       # on disk, and is it safe?
 EOF
 }
 
@@ -201,6 +220,8 @@ fi
 # ---------------------------------------------------------- shared helpers --
 MODEL_ID_RE='^[A-Za-z0-9][A-Za-z0-9._-]*(/[A-Za-z0-9._-]+)?$'
 
+# Format a byte count as "1.5 GB". $1 = bytes (default 0). Decimal units
+# (1000, matching df and the Hub's own sizes), not 1024.
 human() {
   awk -v b="${1:-0}" 'BEGIN {
     split("B KB MB GB TB PB", u, " "); i = 1
@@ -215,7 +236,7 @@ human() {
 filesize() { stat -c %s "$1" 2>/dev/null || stat -f %z "$1" 2>/dev/null || echo 0; }
 
 # sha256 of a file, portable across Linux (sha256sum) and macOS (shasum).
-# Returns non-zero if neither tool exists (caller treats that as "skip verify").
+# Non-zero if neither tool exists (the caller treats that as "skip verify").
 sha256() {
   if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{ print $1 }'
   elif command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1" | awk '{ print $1 }'
@@ -228,13 +249,17 @@ file_birth() {
   local b
   b=$(stat -c %W "$1" 2>/dev/null || true)                 # GNU birth (0/- if unsupported)
   case "$b" in ''|0|-) b=$(stat -f %B "$1" 2>/dev/null || true) ;; esac  # BSD birth
-  case "$b" in ''|0|-) b=$(stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || true) ;; esac  # mtime
+  # mtime as the last resort
+  case "$b" in ''|0|-) b=$(stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || true) ;; esac
   case "$b" in ''|-) b='' ;; esac
   printf '%s' "$b"
 }
 
+# Percent-encode a repo path for a URL, segment by segment, keeping the "/"s.
 enc_path() { jq -rn --arg p "$1" '$p | split("/") | map(@uri) | join("/")'; }
 
+# Guard for options that take a value: call as `need_val "$@"` from the
+# option's case arm; dies when $2 is missing.
 need_val() { [[ $# -ge 2 ]] || die "option $1 requires a value"; }
 
 # Destination safety nets shared by download/update/outdated/audit. Sets
@@ -275,6 +300,10 @@ rmdir_upto() {
   done
 }
 
+# True when path $1 matches any of the shell globs $2... Matching is `case`,
+# so "/" is not special — a glob can span directory separators. Non-zero when
+# nothing matches, including when no globs are given (callers guard with
+# ${#INCLUDES[@]} -gt 0).
 matches_any() {
   local p=$1 g
   shift
@@ -285,8 +314,9 @@ matches_any() {
   return 1
 }
 
-# Accept pasted URLs like https://huggingface.co/org/model[/tree/rev].
-# Sets NORM_MODEL and NORM_UREV (revision embedded in the URL, or empty).
+# Normalize a model id: strip a pasted https://huggingface.co/ (or hf.co/,
+# www.) prefix, any ?query, a trailing slash and a /tree/<rev> suffix. Sets
+# NORM_MODEL and NORM_UREV (the revision embedded in the URL, or empty).
 normalize_model_id() {
   local m=$1
   NORM_UREV=''
@@ -321,6 +351,11 @@ confirm() {
   esac
 }
 
+# Fill in $TOKEN when the caller did not pass -t: $HF_TOKEN, then the hf CLI
+# token file ($HF_HOME/token, default ~/.cache/huggingface/token), then the
+# legacy ~/.huggingface/token — first line, whitespace stripped. TOKEN must
+# already exist (every cmd_* sets TOKEN='') or set -u aborts here. Stays empty
+# when nothing is found: anonymous access is a valid mode.
 resolve_token() {
   local f
   if [[ -z $TOKEN ]]; then TOKEN=${HF_TOKEN:-}; fi
@@ -332,6 +367,8 @@ resolve_token() {
 }
 
 # Temp dir + auth header file (600 perms so the token never shows up in `ps`).
+# Sets TMPD and HDRS, and installs an EXIT trap that removes TMPD — so it must
+# run before any other EXIT trap the command wants to keep.
 setup_net() {
   TMPD=$(mktemp -d "${TMPDIR:-/tmp}/hfget.XXXXXX")
   trap 'rm -rf "$TMPD"' EXIT
@@ -343,6 +380,12 @@ setup_net() {
   } >> "$HDRS"
 }
 
+# GET $1 from the HF API into $TMPD/body (response headers in $TMPD/rhdr).
+# Dies on a network error or any non-200, with a tailored hint for 401 (token),
+# 403 (gated) and 404 (model/revision) — so callers may assume success. Relies
+# on HDRS/TMPD from setup_net and on MODEL/REV for the message text. Sets
+# NEXT_URL to the Link rel="next" URL for pagination, but only when it stays on
+# $HF: the bearer token is never handed to a server-chosen host.
 NEXT_URL=''
 api_get() {
   local url=$1 code msg=''
@@ -350,7 +393,8 @@ api_get() {
               --connect-timeout 15 --max-time 120 --retry 2 "$url" </dev/null) \
     || die "network error contacting huggingface.co (curl exit $?)"
   if [[ $code != 200 ]]; then
-    # Strip control chars — the API error string is untrusted and printed to the TTY.
+    # Strip control chars — the API error string is untrusted and printed
+    # to the TTY.
     msg=$(jq -r '.error // empty' "$TMPD/body" 2>/dev/null | head -n 1 | LC_ALL=C tr -d '\000-\037\177') || msg=''
   fi
   case "$code" in
@@ -369,13 +413,21 @@ api_get() {
 }
 
 # Fetch the recursive file tree of $MODEL @ $REV into $TMPD/files.tsv
-# (size \t lfs-sha \t path). Sets REV_ENC and FILES_TSV.
+# (size \t lfs-sha \t path). Sets REV_ENC, FILES_TSV and REPO_COMMIT (empty
+# unless WANT_OIDS). Two opt-in modes, read from globals the caller sets:
+#   WANT_OIDS=1 → also fills OIDS_TSV (path \t git-oid \t lfs-oid) and resolves
+#                 REPO_COMMIT — needed to write/diff the manifest.
+#   WANT_SCAN=1 → asks for the expanded tree and fills SCAN_TSV
+#                 (path \t status \t pickle-scan \t dangerous imports).
+# Dies on an unsafe repo path, an empty file list, or more than 10000 pages.
 fetch_tree() {
   REV_ENC=$(jq -rn --arg r "$REV" '$r | @uri')
   FILES_TSV="$TMPD/files.tsv"; : > "$FILES_TSV"
-  # When WANT_OIDS=1 (update/manifest paths) also capture, per file, the git
-  # blob oid and lfs sha into OIDS_TSV, and the repo's commit sha from the
-  # response headers — none of which `download` needs by itself.
+  # When WANT_OIDS=1 (download, update and every manifest path) also capture,
+  # per file, the git blob oid and lfs sha into OIDS_TSV, and the repo's
+  # commit sha via a second call to the model-info endpoint (see the end of
+  # this function) — none of it is needed to transfer bytes, only to write and
+  # diff the manifest.
   local want_oids=${WANT_OIDS:-0} want_scan=${WANT_SCAN:-0}
   REPO_COMMIT=''
   if [[ $want_oids -eq 1 ]]; then OIDS_TSV="$TMPD/oids.tsv"; : > "$OIDS_TSV"; fi
@@ -397,7 +449,8 @@ fetch_tree() {
         "$TMPD/body" >> "$OIDS_TSV"
     fi
     if [[ $want_scan -eq 1 ]]; then
-      # Verdict strings are untrusted and end up on the TTY: strip control chars.
+      # Verdict strings are untrusted and end up on the TTY: strip control
+      # characters.
       jq -r '.[] | select(.type == "file") | [
                 .path,
                 (.securityFileStatus.status // "unscanned"),
@@ -410,8 +463,9 @@ fetch_tree() {
     pages=$((pages + 1))
     [[ $pages -lt 10000 ]] || die "too many pages listing $MODEL — aborting"
   done
-  # Record the commit sha of this revision (the tree endpoint doesn't return the
-  # X-Repo-Commit header; the model-info endpoint carries it as .sha). Non-fatal.
+  # Record the commit sha of this revision (the tree endpoint doesn't return
+  # the X-Repo-Commit header; the model-info endpoint carries it as .sha).
+  # Non-fatal.
   if [[ $want_oids -eq 1 ]]; then REPO_COMMIT=$(current_commit "$MODEL" "$REV"); fi
   [[ -s $FILES_TSV ]] || die "no files found in $MODEL at revision '$REV'"
   # Force the size column to a plain non-negative integer. jq's `numbers` still
@@ -435,8 +489,9 @@ apply_filters() {
 }
 
 # Path-traversal guard: repo file paths come from the API and are untrusted.
-# A valid one is relative with no ".." component. Abort on anything that could
-# write outside the destination (absolute path, or a ".." segment). $1 = a TSV
+# A valid one is relative, non-empty, free of control characters and of any
+# ".." component. Dies on an absolute or empty path, a control character (it
+# would corrupt the TSV state files and the TTY) or a ".." segment. $1 = a TSV
 # whose 3rd column is the path.
 assert_safe_paths() {
   local size lfs path
@@ -486,7 +541,7 @@ overview_tsv() {
   fi
 }
 
-# Confirmation before committing to a download/queue; non-zero means abort.
+# Confirmation before committing to a download/queue; non-zero to abort.
 # Above HFGET_WARN_GB (default 100 GB), or on GGUF quant spam, default is No.
 size_guard() {
   local bytes=$1 verb=$2 warn_bytes
@@ -528,6 +583,8 @@ function fmt_key(p,  c, e) {
   if (c != "safe") return c
   e = p; sub(/^.*\./, "", e); return tolower(e)
 }'
+# Shell wrapper around the awk fmt_class(): the class of one path $1 (the
+# commands embed AWK_FMT directly; this keeps the classifier unit-testable).
 fmt_class() { awk "$AWK_FMT"'BEGIN { print fmt_class(ARGV[1]); exit }' "$1"; }
 
 # One-line format summary of a TSV: "safetensors ×3 · pickle ×1 (.bin)".
@@ -552,17 +609,20 @@ fmt_summary() {
 # What a file on disk actually is, from its first 512 bytes (cheap even over
 # SMB; no xxd needed). Prints one of:
 #   gguf | safetensors | torch-zip | pickle | zip | tar | other
-# A torch zip (.pt/.ckpt/most .bin) is a zip whose first member is data.pkl.
+# A torch zip (.pt/.ckpt/most .bin) is reported when "data.pkl" appears in
+# those 512 bytes — normally the first member's name in the local file header.
 sniff_format() {
   local hex
   hex=$(head -c 512 "$1" 2>/dev/null | od -An -tx1 -v | tr -d ' \n')
   case "$hex" in
-    47475546*) echo gguf; return 0 ;;                                            # "GGUF"
-    504b0304*) case "$hex" in *646174612e706b6c*) echo torch-zip ;; *) echo zip ;; esac; return 0 ;;  # "PK\3\4" (+ "data.pkl")
-    800[2-5]*) echo pickle; return 0 ;;                                          # pickle protocol 2-5
+    47475546*) echo gguf; return 0 ;;          # "GGUF"
+    # "PK\3\4" = zip; with "data.pkl" in the first bytes it is a torch pickle
+    504b0304*) case "$hex" in *646174612e706b6c*) echo torch-zip ;; *) echo zip ;; esac; return 0 ;;
+    800[2-5]*) echo pickle; return 0 ;;        # pickle protocol 2-5
   esac
-  if [[ ${hex:16:2} == 7b && ${hex:8:8} == 00000000 ]]; then echo safetensors   # u64 header length, then "{"
-  elif [[ ${hex:514:10} == 7573746172 ]]; then echo tar                          # "ustar" at offset 257
+  # safetensors: u64 LE header length (top bytes zero), then "{"
+  if [[ ${hex:16:2} == 7b && ${hex:8:8} == 00000000 ]]; then echo safetensors
+  elif [[ ${hex:514:10} == 7573746172 ]]; then echo tar   # "ustar" at offset 257
   else echo other; fi
 }
 
@@ -582,7 +642,8 @@ scan_status() {
               --connect-timeout 15 --max-time 60 "$HF/api/models/$id/scan" </dev/null 2>/dev/null || echo 000)
   [[ $code == 200 ]] || return 0
   SCAN_DONE=$(jq -r 'if .scansDone == true then "1" elif .scansDone == false then "0" else "" end' "$TMPD/scan" 2>/dev/null || echo '')
-  # Paths and levels are untrusted and get printed: strip control chars (keep tabs).
+  # Paths and levels are untrusted and get printed: strip control characters
+  # (tabs are kept).
   jq -r '.filesWithIssues[]? | [.path, (.level // "flagged")] | @tsv' "$TMPD/scan" 2>/dev/null \
     | LC_ALL=C tr -d '\000-\010\013-\037\177' > "$SCAN_ISSUES" || : > "$SCAN_ISSUES"
   if [[ -s $SCAN_ISSUES ]]; then SCAN_REPO=flagged
@@ -598,7 +659,8 @@ scan_status() {
 scan_state_for() {
   local tsv=$1 pc=$2
   : > "$TMPD/flagged"
-  if [[ -s ${SCAN_ISSUES:-/nonexistent} ]]; then   # (awk's FNR==NR idiom needs a non-empty first file)
+  # (awk's FNR==NR idiom needs a non-empty first file)
+  if [[ -s ${SCAN_ISSUES:-/nonexistent} ]]; then
     awk -F '\t' -v pc="$pc" 'FNR == NR { lvl[$1] = $2; next } ($pc in lvl) { print $pc "\t" lvl[$pc] }' \
       "$SCAN_ISSUES" "$tsv" > "$TMPD/flagged"
   fi
@@ -647,6 +709,15 @@ scan_gate() {
 # ===========================================================================
 #  download command
 # ===========================================================================
+# 'hfget download <org/model> [base-dir] [options]' — the foreground download.
+# Parses its flags into the globals the shared helpers read (MODEL BASE REV
+# TOKEN LIST DRYRUN JOBS VERIFY REQUIRE_MOUNT ALLOW_UNSAFE INCLUDES EXCLUDES),
+# then runs pre-flight in a fixed order: tree → filters → --list exit → dest
+# safety nets → work list → scan_gate (exit 2 on a flagged file) → auth probe
+# → free space → --dry-run exit → size guard → second-writer check. The
+# destination is created only after every check passes, so a refused or dry
+# run leaves nothing behind. Then run_worklist over WORK_TSV, a summary, and
+# write_manifest. Exits 0, 1 on any failed file, 2 refused, 130 interrupted.
 cmd_download() {
 
 MODEL='' BASE='' REV='main' TOKEN=''
@@ -696,6 +767,8 @@ case "/$MODEL/" in */../*) die "invalid model id '$MODEL' (contains '..')" ;; es
 resolve_token
 setup_net
 
+# Ctrl-C / SIGTERM handler: keep the *.part files, drop $TMPD, kill any
+# parallel fetch_one children, exit 130.
 # shellcheck disable=SC2317,SC2329  # body runs via trap (not statically reachable)
 on_interrupt() {
   trap - INT TERM
@@ -709,14 +782,14 @@ on_interrupt() {
 }
 trap on_interrupt INT TERM
 
-# ------------------------------------------------------- file list & filters --
+# ----------------------------------------------------- file list & filters --
 info "${C_DIM}fetching file list: $MODEL @ $REV${C_OFF}"
 WANT_OIDS=1
 fetch_tree
 apply_filters
 [[ -s $SEL_TSV ]] || die "no files match the given --include/--exclude filters"
 
-# ------------------------------------------------------------------- --list --
+# ------------------------------------------------------------------ --list --
 if [[ $LIST -eq 1 ]]; then
   n=0; total=0
   # Mark files HuggingFace's scanners flagged with "!" (one cheap repo call).
@@ -736,7 +809,7 @@ if [[ $LIST -eq 1 ]]; then
   exit 0
 fi
 
-# ------------------------------------------------- destination & safety nets --
+# ----------------------------------------------- destination & safety nets --
 if [[ -z $BASE ]]; then BASE=${HFGET_DEST:-${HF_NAS_DIR:-}}; fi
 [[ -n $BASE ]] || die "no destination: pass a base dir as the 2nd argument, or set HFGET_DEST (e.g. export HFGET_DEST=\"\$HOME/models\")"
 
@@ -745,7 +818,7 @@ probe=$DEST_PROBE; fs_dev=$FS_DEV
 
 # NB: the destination directory is created only after ALL pre-flight checks
 # pass (auth probe included), so a refused or dry-run download leaves nothing
-# behind on the NAS.
+# behind at the destination.
 DEST="$BASE/$MODEL"
 
 # -------------------------------------------------------------- pre-flight --
@@ -782,8 +855,9 @@ if [[ $n_work -eq 0 ]]; then
   exit 0
 fi
 
-# Ask HuggingFace's scanners about what we are about to fetch; a flagged file
-# means exit 2 here, before the destination even exists (--allow-unsafe overrides).
+# Ask HuggingFace's scanners about what we are about to fetch; a flagged
+# file means exit 2 here, before the destination even exists (--allow-unsafe
+# overrides).
 scan_gate "$WORK_TSV" download 4 || exit $?
 # Files already present count for the manifest's recorded verdict too.
 if [[ ${HFGET_SCAN:-on} != off ]]; then
@@ -901,14 +975,17 @@ QF="$QDIR/queue.tsv"      # pending entries: model \t added \t arg \t arg...
 CF="$QDIR/current.tsv"    # the entry being processed
 FF="$QDIR/failed.tsv"     # failed entries (same format, for retry)
 DL="$QDIR/done.log"       # history
-RP="$QDIR/runner.pid"
-RL="$QDIR/runner.log"
+RP="$QDIR/runner.pid"     # pid of the live runner (kill -0 = alive)
+RL="$QDIR/runner.log"     # the runner's own event log (rlog)
 SF="$QDIR/stop"           # flag: stop after current model
-CLP="$QDIR/current.logpath"
+CLP="$QDIR/current.logpath"   # path of the log the current download writes
 PGF="$QDIR/progress"      # reporter-written live progress for the watcher
 CPF="$QDIR/childprog"     # download-child event log: T total / C current / F finished
-LOCKD="$QDIR/lock"
+LOCKD="$QDIR/lock"        # mkdir-based mutex over the queue files
 
+# Create the queue state dir and files when missing: $QDIR/logs plus empty
+# $QF $CF $FF $DL $RL. Chmods $QDIR to 700 — entries and logs can name private
+# repos. Idempotent; every queue command calls it first.
 q_init() {
   mkdir -p "$QDIR/logs"
   chmod 700 "$QDIR" 2>/dev/null || true   # keep queue state + logs private to this user
@@ -918,6 +995,12 @@ q_init() {
   done
 }
 
+# Take the queue lock — mkdir "$LOCKD" is the atomic primitive — and record our
+# pid in $LOCKD/pid. Spins at 0.2 s, reclaiming the lock when the holder pid is
+# gone or the pid file stays empty for ~2 s (holder died between mkdir and the
+# write). Dies after ~30 s rather than hanging forever. Pair with q_unlock;
+# runner_int drops a self-held lock by hand because runner_requeue_current
+# takes it again.
 q_lock() {
   local tries=0 lpid empty=0
   until mkdir "$LOCKD" 2>/dev/null; do
@@ -940,14 +1023,20 @@ q_lock() {
   done
   echo $$ > "$LOCKD/pid"
 }
+# Release the queue lock — unconditional, so only call it when we hold it.
 q_unlock() { rm -rf "$LOCKD"; }
 
+# True when the pid recorded in $RP is a live process. Non-zero when $RP is
+# missing, empty, or names a process that is gone (a stale pid file after a
+# crash). Does not verify that the pid really is an hfget runner.
 runner_alive() {
   local p
   p=$(cat "$RP" 2>/dev/null || true)
   [[ -n $p ]] && kill -0 "$p" 2>/dev/null
 }
 
+# Append one timestamped line to the runner log $RL — the daemon's only output
+# channel (it has no terminal).
 rlog() { printf '%s %s\n' "$(date '+%F %T')" "$*" >> "$RL"; }
 
 # Parse one queue line into ENTRY_MODEL / ENTRY_ARGS.
@@ -984,6 +1073,11 @@ foreign_hfget_pids() {
   ' | tr '\n' ' ' | sed 's/ *$//'
 }
 
+# Start the background runner unless one is already alive (then just report
+# its pid): clear the $SF stop flag, nohup "$SELF run --daemon" appending to
+# $RL, disown it, and poll runner_alive for up to 5 s — the daemon re-execs
+# under caffeinate (macOS) before it writes its pid file, so one fixed second
+# is not enough under load. Warns — never dies — when it fails to appear.
 q_maybe_start_runner() {
   if runner_alive; then
     info "runner already active (pid $(cat "$RP"))"
@@ -992,8 +1086,6 @@ q_maybe_start_runner() {
   rm -f "$SF"
   HFGET_CAFFEINATED='' nohup "$SELF" run --daemon >> "$RL" 2>&1 &
   disown 2>/dev/null || true
-  # The daemon re-execs under caffeinate (macOS) before it writes its pid
-  # file; give it up to 5 s rather than one fixed second under load.
   local i=0
   while [[ $i -lt 25 ]] && ! runner_alive; do sleep 0.2; i=$((i + 1)); done
   if runner_alive; then
@@ -1004,6 +1096,17 @@ q_maybe_start_runner() {
 }
 
 # ---------------------------------------------------------------- commands --
+# 'hfget add <model...> [download options]' — queue models. Leading non-option
+# words are model ids (pasted URLs accepted); everything from the first option
+# on is shared by all of them and stored per entry as "model \t added \t
+# arg...", except -t/--token (stripped: no credential in the state file) and
+# -y/--no-start (apply to this add only). The base dir is resolved to an
+# absolute path now, or taken from HFGET_DEST and appended, so a queued
+# download can never fail later for lack of a destination. Each model is
+# checked against the API first — tree, filters, gated probe, scan_gate,
+# size_guard — and skipped (not queued) when any of them refuse. A model
+# sitting in the failed list is re-queued and its failed copy dismissed.
+# Starts the runner unless --no-start / HFGET_QUEUE_NOSTART.
 cmd_add() {
   q_init
   local nostart=${HFGET_QUEUE_NOSTART:-}
@@ -1062,8 +1165,9 @@ cmd_add() {
   fi
 
   # Resolve the destination NOW and bake it into every entry, so a queued
-  # download can never fail later because the runner lacks HF_NAS_DIR (or
-  # runs from another working directory: a relative base dir is made absolute).
+  # download can never fail later because the runner lacks HFGET_DEST (or its
+  # legacy alias HF_NAS_DIR), or runs from another working directory: a
+  # relative base dir is made absolute here.
   # A base dir is anything path-shaped: absolute, ./ ../ ~, or ending in "/".
   local base='' base_from_env=0 qa=() expect_val=0
   for a in ${qargs[@]+"${qargs[@]}"}; do
@@ -1182,11 +1286,16 @@ RUN_CHILD=0
 RUN_REPORTER=0
 CUR_ACTIVE=0
 
-# Combines the download child's event log (exact totals, local) with one stat
-# of the in-flight .part (NAS) into a LOCAL progress file for the watcher:
-#   epoch \t percent \t progressed \t total \t current-file \t part-bytes
-# The watcher only ever reads that local file, so its redraws can never stall
-# on slow SMB metadata calls.
+# Combine the download child's event log (exact totals, local) with one stat
+# per .part still in flight (on the destination — possibly a slow network
+# mount) into a LOCAL progress file for the watcher:
+#   epoch \t percent \t progressed \t total \t name \t part-bytes
+# $1 = the model's destination dir, where the .part files live. "name" is the
+# basename of the OLDEST in-flight file plus " (+N more)" when -j > 1 keeps
+# several open; "part-bytes" is the size of the LAST .part statted (unused by
+# the watcher). The watcher only ever reads that local file, so its redraws
+# can never stall on slow SMB metadata calls. Refreshes every 3 s and exits
+# with the runner ($$ is the runner's pid even in this background subshell).
 progress_reporter() {
   local d=$1 total fdone csize coff cpath ps gain g prog pct ninf first name
   while :; do
@@ -1231,6 +1340,9 @@ progress_reporter() {
   done
 }
 
+# Stop the background progress reporter and clear its files: kill and reap
+# $RUN_REPORTER, reset it to 0, remove $PGF, $PGF.tmp, $PGF.calc and $CPF so
+# the watcher shows no stale progress between models. Safe when none runs.
 stop_reporter() {
   if [[ $RUN_REPORTER -ne 0 ]]; then
     kill "$RUN_REPORTER" 2>/dev/null || true
@@ -1240,6 +1352,9 @@ stop_reporter() {
   rm -f "$PGF" "$PGF.tmp" "$PGF.calc" "$CPF"
 }
 
+# Put the entry in $CF back at the FRONT of $QF and clear $CF/$CLP, so an
+# interrupted model is the next one tried. Takes q_lock itself — the caller
+# must NOT hold it (runner_int drops a self-held lock first).
 runner_requeue_current() {
   q_lock
   if [[ -s $CF ]]; then
@@ -1250,6 +1365,10 @@ runner_requeue_current() {
   q_unlock
 }
 
+# INT/TERM handler for the runner (installed by cmd_run): detach, release a
+# self-held queue lock, signal the whole download child process group
+# (RUN_CHILD), stop the reporter, re-queue the in-flight entry when
+# CUR_ACTIVE=1, remove $RP and exit 130. Everything left behind is resumable.
 runner_int() {
   trap - INT TERM
   rlog "runner interrupted — re-queueing current entry and exiting"
@@ -1265,6 +1384,10 @@ runner_int() {
   exit 130
 }
 
+# Block while a foreign foreground 'hfget download' is running, so the runner
+# never becomes a second writer. Polls foreign_hfget_pids every 5 s — short,
+# so 'hfget stop' is honored mid-wait ($SF ends the wait) — and logs once.
+# Returns 0 at once under HFGET_QUEUE_NOWAIT, and always returns 0.
 wait_for_foreign() {
   if [[ -n ${HFGET_QUEUE_NOWAIT:-} ]]; then return 0; fi
   local logged=0 pids
@@ -1282,6 +1405,17 @@ wait_for_foreign() {
   return 0
 }
 
+# 'hfget run [--daemon]' — drain the queue in this process (this IS the
+# background runner; --daemon = started by q_maybe_start_runner, log to $RL
+# only). Exits 0 at once if another runner holds $RP. Owns the runner state:
+# writes $RP, clears $SF, traps INT/TERM into runner_int, re-queues a leftover
+# $CF from a crashed runner. Per entry: pop the head of $QF into $CF under
+# q_lock, wait_for_foreign, spawn "$SELF download" as RUN_CHILD with
+# HFGET_YES=1 (confirmed at 'add' time; the child is non-tty) and
+# HFGET_PROG=$CPF, run progress_reporter alongside, then record the outcome in
+# $DL and, on failure, the entry in $FF. `set -m` gives the child its own
+# process group so runner_int can signal the whole download tree. Exits 1 if
+# any model failed.
 cmd_run() {
   local daemon=0
   if [[ ${1:-} == --daemon ]]; then daemon=1; shift; fi
@@ -1385,6 +1519,12 @@ cmd_run() {
   exit 0
 }
 
+# Render the whole queue view to STDOUT, one shot: runner state, the current
+# entry with elapsed time and progress bar, then pending, failed and done
+# counts. Reads only local state — $RP $CF $CLP $PGF $QF $FF $DL — never the
+# destination, so a redraw can never stall on slow NAS metadata (a pre-2.3
+# 3-field $PGF is still rendered). cmd_queue captures this output once per
+# interval, so it must only print — never prompt, never exit.
 render_status() {
   q_init
   if runner_alive; then
@@ -1407,7 +1547,7 @@ render_status() {
         if [[ -n $lastline ]]; then echo "         $lastline"; fi
       fi
       # Progress bar from the runner's local progress file — the watcher
-      # itself never touches the NAS, so redraws cannot stall on slow SMB
+      # itself never touches the destination, so redraws cannot stall on SMB
       # metadata calls.
       if [[ -f $PGF ]]; then
         p_ts='' p_pct='' p_prog='' p_total='' p_name='' p_bytes=''
@@ -1478,6 +1618,7 @@ render_status() {
   fi
 }
 
+# 'hfget status' — a one-shot snapshot (the live view is 'hfget queue').
 cmd_status() { render_status; }
 
 # Live watch view: redraw the status every second (or a given interval)
@@ -1498,6 +1639,11 @@ cmd_queue() {
   done
 }
 
+# 'hfget rm <n|model>' — drop a queue entry. $1 is a 1-based position in the
+# pending list (as printed by 'hfget queue') or a model id / URL, which is
+# normalized and removed from BOTH pending and failed, so a dead entry can be
+# dismissed with the same command. Rewrites $QF/$FF under q_lock; warns when
+# nothing matched. Never touches the model currently downloading ('hfget stop').
 cmd_rm() {
   q_init
   [[ $# -ge 1 ]] || die "usage: hfget rm <number|model>"
@@ -1526,6 +1672,13 @@ cmd_rm() {
   fi
 }
 
+# 'hfget clear [--all|--failed]' — empty the queue. Default: pending only,
+# leaving failed entries and the running download alone. --failed/-f dismisses
+# the failed list and nothing else. --all/-a first stops an active runner
+# (SIGTERM, waited for up to 10 s — exits 1 and clears nothing if it will not
+# die) so its trap re-queues the current entry, then wipes $QF $FF $CF and the
+# $SF/$CLP flags. Partial *.part files are always kept: they resume if the
+# model is added again. Every mutation happens under q_lock.
 cmd_clear() {
   q_init
   local all=0 failed_only=0 n nf stopped=0 i
@@ -1581,6 +1734,10 @@ cmd_clear() {
   fi
 }
 
+# 'hfget retry' — move every failed entry back onto the end of the pending
+# queue under q_lock, keeping each entry's stored options, then start the
+# runner unless HFGET_QUEUE_NOSTART is set. Exits 0 with a note when there is
+# nothing to retry.
 cmd_retry() {
   q_init
   local n
@@ -1599,6 +1756,10 @@ cmd_retry() {
   if [[ -z ${HFGET_QUEUE_NOSTART:-} ]]; then q_maybe_start_runner; fi
 }
 
+# 'hfget stop [--now]' — ask the runner to stop. Default: touch the $SF flag so
+# it exits after the current model. --now sends SIGTERM to the pid in $RP and
+# runner_int re-queues the model in progress — either way nothing is lost and
+# .part files resume. Exits 0 when no runner is active.
 cmd_stop() {
   q_init
   if ! runner_alive; then
@@ -1614,6 +1775,10 @@ cmd_stop() {
   fi
 }
 
+# 'hfget log [model]' — show a download log from $QDIR/logs. With a model id
+# or URL, its newest log; without, the log of the download in progress ($CLP),
+# else the most recent log file. Follows it with 'tail -f' on a terminal,
+# otherwise prints the last 50 lines and returns. Dies when no log exists.
 cmd_log() {
   q_init
   local logf=''
@@ -1642,18 +1807,24 @@ cmd_log() {
 #  update / outdated  — manifest + diff helpers
 # ===========================================================================
 # Every managed model carries a tiny manifest inside its own folder, recording
-# the files + content hashes + revision hfget last put there. It lets a later
-# 'update' diff exactly (catching same-size content changes) and prune safely
-# (only files hfget itself recorded), without re-reading gigabytes off the disk.
+# the files + content hashes + revision + commit hfget last put there, when,
+# the -i/-x filter it used, and the scanners' verdict at that moment. It lets
+# a later 'update' diff exactly (catching same-size content changes), stay
+# pinned to the same filter and prune safely (only files hfget itself
+# recorded), lets 'outdated' compare one commit sha, and lets 'audit' show
+# what is on disk — all without re-reading gigabytes off the disk.
 MANIFEST_REL=".hfget/manifest.tsv"
 manifest_file() { printf '%s/%s' "$1" "$MANIFEST_REL"; }
 
+# Row count of TSV $1 (a line count); 0 when the file is missing.
 nrows() { awk 'END { print NR + 0 }' "$1" 2>/dev/null || echo 0; }
+# Sum of the size column (field 2) of TSV $1 — the manifest/CLS_* row layout
+# (path \t size \t lfs \t git); 0 when the file is missing.
 bsum()  { awk -F '\t' '{ s += $2 } END { printf "%d", s + 0 }' "$1" 2>/dev/null || echo 0; }
 
-# Combine the current tree into TREE4 (path \t size \t lfs \t git-oid), sorted by
-# path. Needs FILES_TSV + OIDS_TSV from fetch_tree (WANT_OIDS=1). Non-zero if the
-# oid data is missing.
+# Combine the current tree into TREE4 (path \t size \t lfs \t git-oid), sorted
+# by path. Needs FILES_TSV + OIDS_TSV from fetch_tree (WANT_OIDS=1). Non-zero
+# if the oid data is missing.
 build_tree4() {
   [[ -n ${OIDS_TSV:-} && -f ${OIDS_TSV:-/nonexistent} ]] || return 1
   TREE4="$TMPD/tree4.tsv"
@@ -1672,9 +1843,13 @@ read_manifest_rows() {
   grep -v '^#' "$mf" 2>/dev/null || true
 }
 
-# Parse a manifest's header into MANIFEST_REV / MANIFEST_COMMIT / MANIFEST_UPDATED
-# / MANIFEST_SCAN (each empty if absent; SCAN is the scanner verdict recorded
-# for the files hfget put there: flagged | clear | partial | unknown).
+# Parse a manifest's header into MANIFEST_REV / MANIFEST_COMMIT /
+# MANIFEST_UPDATED / MANIFEST_SCAN and the recorded filter into the
+# MANIFEST_INCLUDES / MANIFEST_EXCLUDES arrays (each empty if absent; SCAN is
+# the scanner verdict recorded for the files hfget put there:
+# flagged | clear | partial | unknown). Everything is reset first, so a failed
+# call never leaks the previous model's values into a loop. Non-zero when the
+# manifest or its '# hfget ' header line is missing.
 read_manifest_header() {
   local mf hdr g; mf=$(manifest_file "$1")
   MANIFEST_REV=''; MANIFEST_COMMIT=''; MANIFEST_UPDATED=''; MANIFEST_SCAN=''
@@ -1696,12 +1871,16 @@ read_manifest_header() {
   return 0
 }
 
-# Write/refresh $DEST's manifest from the current tree, listing only files that
-# are actually present on disk at full size. An optional extra-rows file ($1)
-# adds entries to preserve for files not in the tree but still on disk — i.e.
-# stale files the user chose to KEEP, so a later 'update' still knows hfget put
-# them there (stale paths are disjoint from tree paths, so no dedup is needed).
-# Atomic; never writes outside DEST_REAL; skipped when HFGET_NO_MANIFEST is set.
+# Write/refresh $DEST's manifest from TREE4, listing only tree files that are
+# actually present on disk at full size. The header records VERSION, REV,
+# REPO_COMMIT, a timestamp and SCAN_STATE, then the active INCLUDES/EXCLUDES
+# globs. An optional extra-rows file ($1) adds entries to preserve for files
+# not in the tree but still on disk (existence is checked, not size) — i.e.
+# stale files the user chose to KEEP, so a later 'update' still knows hfget
+# put them there (stale paths are disjoint from tree paths, so no dedup is
+# needed). Atomic; never writes outside DEST_REAL; skipped when
+# HFGET_NO_MANIFEST is set or TREE4 is missing. Always returns 0 — failing to
+# write the manifest must never fail the download.
 write_manifest() {
   local extra=${1:-}
   [[ -z ${HFGET_NO_MANIFEST:-} ]] || return 0
@@ -1714,8 +1893,9 @@ write_manifest() {
   mf="$mdir/manifest.tsv"; mtmp="$mf.tmp.$$"
   ts=$(date -u +%FT%TZ)
   {
-    # scan= is the scanner verdict for these files at the time of writing, so
-    # 'audit --offline' can show it and 'update' can tell "was clear, now flagged".
+    # scan= is the scanner verdict for these files at the time of writing,
+    # so 'audit --offline' can show it and 'update' can tell "was clear, now
+    # flagged".
     printf '# hfget %s rev=%s commit=%s updated=%s scan=%s\n' "$VERSION" "$REV" "${REPO_COMMIT:-}" "$ts" "${SCAN_STATE:-unknown}"
     # Remember the filter this model was downloaded with, so a later 'update'
     # (or 'update --all') stays pinned to the same subset (e.g. one GGUF quant)
@@ -1892,9 +2072,10 @@ backup_stale() {
 
 # Refresh one model in place: fetch the current tree, diff it against the
 # in-folder manifest, download only what changed/is new, reconcile stale files,
-# and rewrite the manifest. Reads the per-run flags (rehash, stale_mode, REV_*)
-# from cmd_update via dynamic scope. Returns non-zero on any failure (so --all
-# can carry on to the next model).
+# and rewrite the manifest. Reads the per-run flags (rehash, stale_mode,
+# REV_ARG/REV_FORCED, USER_INC/USER_EXC, BASE, DRYRUN) from cmd_update via
+# dynamic scope. Non-zero on any failure (so --all can carry on to the next
+# model).
 update_one() {
   local model=$1 mf mrows have_manifest=0
 
@@ -1912,10 +2093,10 @@ update_one() {
   else REV=main; fi
   [[ -n $REV ]] || REV=main
 
-  # Per-model filter: start from what the user typed this run; if they gave none,
-  # inherit the filter recorded in THIS model's manifest — so a partial download
-  # (e.g. a single GGUF quant) stays partial instead of expanding to the whole
-  # repo. An explicit -i/-x always overrides and is re-recorded.
+  # Per-model filter: start from what the user typed this run; if they gave
+  # none, inherit the filter recorded in THIS model's manifest — so a partial
+  # download (e.g. a single GGUF quant) stays partial instead of expanding to
+  # the whole repo. An explicit -i/-x always overrides and is re-recorded.
   INCLUDES=(${USER_INC[@]+"${USER_INC[@]}"})
   EXCLUDES=(${USER_EXC[@]+"${USER_EXC[@]}"})
   if [[ ${#INCLUDES[@]} -eq 0 && ${#EXCLUDES[@]} -eq 0 ]]; then
@@ -1985,7 +2166,8 @@ update_one() {
     exclude_by_path "$CLS_STALE" "$TMPD/ren_src"
   fi
 
-  # Stale = recorded-but-gone files still present on disk (rename sources removed).
+  # Stale = recorded-but-gone files still present on disk (rename sources
+  # already removed).
   STALE_FINAL="$TMPD/stale_final"; : > "$STALE_FINAL"
   if [[ -s $CLS_STALE ]]; then
     local sp ss sl sg
@@ -2175,6 +2357,15 @@ update_one() {
   return 0
 }
 
+# 'hfget update <org/model...> [base-dir] [options]' — refresh named models, or
+# with --all every managed model under the base dir. Parses the flags into the
+# globals update_one reads (BASE TOKEN REV_ARG/REV_FORCED JOBS VERIFY DRYRUN
+# ALLOW_UNSAFE REQUIRE_MOUNT INCLUDES/EXCLUDES) plus the locals `rehash` and
+# `stale_mode` (ask|prune|keep|backup) it picks up by dynamic scope, and copies
+# the user's filter into USER_INC/USER_EXC so each model starts clean. A
+# path-shaped argument (absolute, ./ ../ ~, "." or a trailing "/") is the base
+# dir; anything else is a model id. Exits 1 if any model failed — one bad
+# model never stops the rest.
 cmd_update() {
   MODEL='' BASE='' TOKEN='' REV='' REV_ARG='' REV_FORCED=0
   JOBS=1 VERIFY=0 REQUIRE_MOUNT=0 DRYRUN=0 ALLOW_UNSAFE=0
@@ -2239,15 +2430,18 @@ cmd_update() {
   fi
   dest_safety_nets "$BASE" 1
 
-  # Remember the filter the user typed (if any) so each model in an --all run can
-  # start clean and, when the user gave none, inherit its own recorded filter.
+  # Remember the filter the user typed (if any) so each model in an --all run
+  # can start clean and, when the user gave none, inherit its own recorded
+  # filter.
   USER_INC=(${INCLUDES[@]+"${INCLUDES[@]}"})
   USER_EXC=(${EXCLUDES[@]+"${EXCLUDES[@]}"})
 
   resolve_token
   setup_net
 
-  # shellcheck disable=SC2317,SC2329  # invoked via trap
+  # Ctrl-C / SIGTERM handler: keep the *.part files, drop $TMPD, kill any
+  # parallel fetch_one children, exit 130.
+  # shellcheck disable=SC2317,SC2329  # body runs via trap (not statically reachable)
   on_interrupt() {
     trap - INT TERM
     printf '\n' >&2
@@ -2412,10 +2606,12 @@ cmd_scan() {
 }
 
 # One table of every managed model under a base dir: size, when it was
-# fetched, the filter it was fetched with, which weight formats are really on
-# disk (by sniffing bytes, not trusting names) and the scanners' verdict —
-# refreshed with one call per model, or, with --offline, as recorded at fetch
-# time. Exit 2 if anything is flagged or a hidden pickle turns up.
+# fetched, the filter it was fetched with, which weight formats are on disk
+# (classified by name, then corrected by sniffing the first bytes of every
+# weight-sized file ≥ 1 MB that is really there) and the scanners' verdict —
+# refreshed with one call per model, or, with --offline (also implied by
+# HFGET_SCAN=off), as recorded at fetch time. Exit 2 if anything is flagged
+# or a hidden pickle turns up.
 cmd_audit() {
   BASE='' TOKEN=''
   local a offline=0
@@ -2536,20 +2732,26 @@ cmd_audit() {
 # ===========================================================================
 #  shared download engine (used by 'download' and 'update')
 # ===========================================================================
-# Download one repo file. Args: idx, size, lfs-sha (or "-"), repo path, and an
-# optional mode. mode="changed" means the file already exists at full size but
-# its content moved upstream: start a fresh .part and let the final atomic mv
-# overwrite it (never resume onto stale bytes). Any other mode keeps the normal
-# size-skip + resume. Relies on caller-set globals: DEST DEST_REAL MODEL REV_ENC
-# HDRS VERIFY n_work RESULTS PROGF QUIET MIN_SPEED SPEED_TIME.
-
 # Record a failed file for the run summary and, for the queue's progress
 # reporter, take it out of the in-flight set (it contributed 0 bytes).
+# $1 = repo-relative path. Appends FAIL to $RESULTS and, when PROGF is set,
+# "F 0 path" to $PROGF. Only fetch_one calls it.
 mark_fail() {
   printf 'FAIL\t0\t%s\n' "$1" >> "$RESULTS"
   if [[ -n ${PROGF:-} ]]; then printf 'F\t0\t%s\n' "$1" >> "$PROGF"; fi
 }
 
+# Download one repo file. $1 = index (for "[i/n]" messages), $2 = size in
+# bytes, $3 = lfs sha256 (or "-"), $4 = repo-relative path, $5 = mode
+# (optional). mode="changed" means the file already exists at full size but its
+# content moved upstream: start a fresh .part and let the final atomic mv
+# overwrite it (never resume onto stale bytes). Any other mode keeps the normal
+# size-skip + resume. Relies on caller-set globals: HF DEST DEST_REAL MODEL
+# REV_ENC HDRS VERIFY n_work RESULTS PROGF QUIET MIN_SPEED SPEED_TIME. Returns
+# 0 when the file is complete or skipped, 1 (via mark_fail) on a symlink or
+# out-of-DEST target, HTTP 401/403/404, a sha256 mismatch under --verify,
+# three reconnects without progress, or 12 h on one file. Never dies, so
+# run_worklist carries on.
 fetch_one() {
   local idx=$1 size=$2 lfs=$3 path=$4 mode=${5:-0}
   local out="$DEST/$path" part url have got rc code stall pre fstart start_have sum outdir
@@ -2678,8 +2880,9 @@ fetch_one() {
   return 0
 }
 
-# Drain WORK_TSV (idx \t size \t lfs \t path [\t mode]) through fetch_one, either
-# sequentially or with JOBS parallel workers. Results accumulate in $RESULTS.
+# Drain WORK_TSV (idx \t size \t lfs \t path [\t mode]) through fetch_one,
+# either sequentially or with JOBS parallel workers. Results accumulate in
+# $RESULTS.
 run_worklist() {
   local idx size lfs path mode
   if [[ $JOBS -eq 1 ]]; then
