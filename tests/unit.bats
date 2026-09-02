@@ -5,8 +5,16 @@
 
 setup() {
   HFGET="${BATS_TEST_DIRNAME}/../hfget"
+  # Never let a test touch the developer's real ~/.hfget: point the queue
+  # state at a throwaway dir BEFORE sourcing (QDIR is derived at source time).
+  UNIT_STATE="$(mktemp -d)"
+  export HFGET_STATE_DIR="$UNIT_STATE" HFGET_NOCAFFEINE=1
   # shellcheck disable=SC1090
   source "$HFGET"
+}
+
+teardown() {
+  [ -n "${UNIT_STATE:-}" ] && rm -rf "$UNIT_STATE"
 }
 
 @test "human formats byte counts" {
@@ -187,13 +195,194 @@ setup() {
   rm -rf "$TMPD"
 }
 
-@test "discover_models finds org/model dirs carrying a manifest" {
+@test "discover_models finds org/model dirs carrying a manifest, and bare-id models" {
   base="$(mktemp -d)"
-  mkdir -p "$base/orgA/modelX/.hfget" "$base/orgB/modelY/.hfget" "$base/orgC/plain"
+  mkdir -p "$base/orgA/modelX/.hfget" "$base/orgB/modelY/.hfget" "$base/orgC/plain" "$base/gpt2/.hfget"
   : > "$base/orgA/modelX/.hfget/manifest.tsv"
   : > "$base/orgB/modelY/.hfget/manifest.tsv"
-  [ "$(discover_models "$base" | sort | tr '\n' ' ')" = "orgA/modelX orgB/modelY " ]
+  : > "$base/gpt2/.hfget/manifest.tsv"          # canonical model with a bare id
+  [ "$(discover_models "$base" | sort | tr '\n' ' ')" = "gpt2 orgA/modelX orgB/modelY " ]
   rm -rf "$base"
+}
+
+# ---------------------------------------------------------------- safety ----
+
+@test "fmt_class classifies formats by extension" {
+  [ "$(fmt_class a/pytorch_model.bin)" = "pickle" ]
+  [ "$(fmt_class sd.ckpt)" = "pickle" ]
+  [ "$(fmt_class model.nemo)" = "pickle" ]
+  [ "$(fmt_class tf_model.h5)" = "keras" ]
+  [ "$(fmt_class modeling_x.py)" = "code" ]
+  [ "$(fmt_class dir.v2/w.SafeTensors)" = "safe" ]
+  [ "$(fmt_class Q4.GGUF)" = "safe" ]
+  [ "$(fmt_class unet/model.onnx)" = "safe" ]
+  [ "$(fmt_class README.md)" = "other" ]
+  [ "$(fmt_class noext)" = "other" ]
+}
+
+@test "fmt_summary lists risky formats first and names their extensions" {
+  t="$(mktemp)"
+  printf 'a.safetensors\t1\nb.safetensors\t2\nc.bin\t3\nd.pt\t4\nconfig.json\t5\ne.gguf\t6\n' > "$t"
+  [ "$(fmt_summary "$t" 1)" = "pickle ×2 (.bin, .pt) · safetensors ×2 · gguf ×1" ]
+  printf 'config.json\t1\nREADME.md\t2\n' > "$t"
+  [ "$(fmt_summary "$t" 1)" = "(no weight files)" ]
+  # a precomputed key column (audit, after sniffing) overrides the extension
+  printf 'model.safetensors\t9\tpickle\n' > "$t"
+  [ "$(fmt_summary "$t" 1 3)" = "pickle ×1 (.safetensors)" ]
+  rm -f "$t"
+}
+
+@test "sniff_format recognises gguf / safetensors / pickle / torch-zip from the first bytes" {
+  d="$(mktemp -d)"
+  printf 'GGUF\003\000\000\000rest' > "$d/g"
+  printf '\132\000\000\000\000\000\000\000{"__metadata__":{}}' > "$d/s"     # u64 LE header length, then "{"
+  printf '\200\004\225\000' > "$d/p"                                            # pickle protocol 4
+  printf 'PK\003\004%026d' 0 > "$d/t"; printf 'archive/data.pkl' >> "$d/t"     # zip whose first member is data.pkl
+  printf 'PK\003\004%026d' 0 > "$d/z"; printf 'hello.txt' >> "$d/z"
+  printf 'just text' > "$d/o"
+  : > "$d/e"
+  [ "$(sniff_format "$d/g")" = "gguf" ]
+  [ "$(sniff_format "$d/s")" = "safetensors" ]
+  [ "$(sniff_format "$d/p")" = "pickle" ]
+  [ "$(sniff_format "$d/t")" = "torch-zip" ]
+  [ "$(sniff_format "$d/z")" = "zip" ]
+  [ "$(sniff_format "$d/o")" = "other" ]
+  [ "$(sniff_format "$d/e")" = "other" ]
+  rm -rf "$d"
+}
+
+@test "scan_state_for intersects the scanner's flagged files with a selection" {
+  TMPD="$(mktemp -d)"
+  sel="$TMPD/sel"; printf '10\t-\tconfig.json\n20\tsha\tpytorch_model.bin\n' > "$sel"
+  SCAN_ISSUES="$TMPD/issues"
+  printf 'pytorch_model.bin\tunsafe\nother.bin\tunsafe\n' > "$SCAN_ISSUES"; SCAN_DONE=1
+  scan_state_for "$sel" 3
+  [ "$N_FLAG" = "1" ]; [ "$SCAN_STATE" = "flagged" ]
+  grep -q $'^pytorch_model.bin\tunsafe$' "$TMPD/flagged"
+  printf 'other.bin\tunsafe\n' > "$SCAN_ISSUES"        # flagged upstream, but not selected
+  scan_state_for "$sel" 3
+  [ "$N_FLAG" = "0" ]; [ "$SCAN_STATE" = "clear" ]
+  : > "$SCAN_ISSUES"; SCAN_DONE=0                       # nothing flagged, scans still running
+  scan_state_for "$sel" 3
+  [ "$N_FLAG" = "0" ]; [ "$SCAN_STATE" = "partial" ]
+  SCAN_DONE=''
+  scan_state_for "$sel" 3
+  [ "$SCAN_STATE" = "unknown" ]
+  rm -rf "$TMPD"
+}
+
+@test "scan_gate refuses a flagged selection (exit 2) unless --allow-unsafe; HFGET_SCAN=off skips it" {
+  TMPD="$(mktemp -d)"; MODEL=org/model
+  sel="$TMPD/sel"; printf '10\t-\tconfig.json\n20\tsha\tpytorch_model.bin\n' > "$sel"
+  # Pre-seed the per-run cache so scan_status makes no network call.
+  SCAN_FOR=$MODEL; SCAN_DONE=1; SCAN_REPO=flagged
+  SCAN_ISSUES="$TMPD/issues"; printf 'pytorch_model.bin\tunsafe\n' > "$SCAN_ISSUES"
+  ALLOW_UNSAFE=0
+  run scan_gate "$sel" download 3
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"FLAGGED"* ]]
+  [[ "$output" == *"refusing to download"* ]]
+  ALLOW_UNSAFE=1
+  run scan_gate "$sel" download 3
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"--allow-unsafe given"* ]]
+  ALLOW_UNSAFE=0
+  HFGET_SCAN=off run scan_gate "$sel" download 3
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+  # a clean selection in a flagged repo passes, and says so
+  printf '10\t-\tconfig.json\n' > "$sel"
+  run scan_gate "$sel" download 3
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"not among the files to fetch"* ]]
+  rm -rf "$TMPD"
+}
+
+@test "manifest header records and reads back the scanner verdict and timestamp" {
+  TMPD="$(mktemp -d)"; DEST="$TMPD/dest"; mkdir -p "$DEST"
+  DEST_REAL="$(cd "$DEST" && pwd -P)"; REV=main; REPO_COMMIT=abc; INCLUDES=(); EXCLUDES=()
+  printf 'AAAA' > "$DEST/f1"
+  TREE4="$TMPD/tree4"; printf 'f1\t4\tsha1\t-\n' > "$TREE4"
+  SCAN_STATE=partial
+  write_manifest
+  grep -q ' scan=partial$' "$DEST/.hfget/manifest.tsv"
+  read_manifest_header "$DEST"
+  [ "$MANIFEST_SCAN" = "partial" ]
+  [[ "$MANIFEST_UPDATED" == 20*T*Z ]]
+  rm -rf "$TMPD"
+}
+
+@test "audit --offline reports recorded verdicts, hidden pickles and filters, exit 2 when anything is flagged" {
+  base="$(mktemp -d)"
+  mkdir -p "$base/org/clean/.hfget" "$base/org/bad/.hfget" "$base/org/hidden/.hfget"
+  printf '# hfget 2.9.0 rev=main commit=x updated=2026-09-01T00:00:00Z scan=clear\nmodel.safetensors\t4\tsha\t-\n' > "$base/org/clean/.hfget/manifest.tsv"
+  printf 'AAAA' > "$base/org/clean/model.safetensors"
+  printf '# hfget 2.9.0 rev=main commit=x updated=2026-08-24T00:00:00Z scan=flagged\npytorch_model.bin\t4\tsha\t-\n' > "$base/org/bad/.hfget/manifest.tsv"
+  printf 'AAAA' > "$base/org/bad/pytorch_model.bin"
+  # a "safetensors" whose bytes are a pickle, big enough (>= 1 MB) to be sniffed
+  printf '# hfget 2.9.0 rev=main commit=x updated=2026-09-01T00:00:00Z scan=unknown\n# include\t*.safetensors\nmodel.safetensors\t1100003\tsha\t-\n' > "$base/org/hidden/.hfget/manifest.tsv"
+  { printf '\200\004\225'; head -c 1100000 /dev/zero; } > "$base/org/hidden/model.safetensors"
+  HFGET_NOCAFFEINE=1 run bash "$HFGET" audit "$base" --offline
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"org/clean"*"recorded: clear"* ]]
+  [[ "$output" == *"org/bad"*"recorded: flagged"* ]]
+  [[ "$output" == *"HIDDEN PICKLE: model.safetensors"* ]]
+  [[ "$output" == *"filter *.safetensors"* ]]
+  [[ "$output" == *"1 FLAGGED"* ]]
+  rm -rf "$base"
+}
+
+@test "rmdir_upto removes emptied dirs below the model dir but never the model dir or above" {
+  base="$(mktemp -d)"; dest="$base/org/model"
+  mkdir -p "$dest/a/b/c" "$dest/a/other"
+  rmdir_upto "$dest" "$dest/a/b/c"
+  [ ! -d "$dest/a/b" ]          # emptied chain removed
+  [ -d "$dest/a" ]              # sibling keeps this one alive
+  rmdir "$dest/a/other"
+  rmdir_upto "$dest" "$dest/a"
+  [ ! -d "$dest/a" ]
+  [ -d "$dest" ]                # the model dir itself survives even when empty
+  rmdir_upto "$dest" "$base/org"   # outside the top: refused
+  [ -d "$base/org" ]
+  rm -rf "$base"
+}
+
+@test "dest_safety_nets honors --require-mount and warns on the /Volumes trap" {
+  d="$(mktemp -d)"
+  REQUIRE_MOUNT=0
+  run dest_safety_nets "$d" 1
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+  REQUIRE_MOUNT=1
+  run dest_safety_nets "$d" 1
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"--require-mount"*"not on a network mount"* ]]
+  REQUIRE_MOUNT=0
+  run dest_safety_nets "/Volumes/definitely-not-mounted-$$" 0
+  [ "$status" -eq 0 ]
+  if [ "$(uname)" = "Darwin" ]; then
+    [[ "$output" == *"resolves to the local disk"* ]]
+    [[ "$output" != *"--require-mount"* ]]   # commands without the flag don't advertise it
+  fi
+  rm -rf "$d"
+}
+
+@test "foreign_hfget_pids can be narrowed to one model id" {
+  # Fake another 'hfget download' of a model: argv[0] is what ps shows. It is
+  # spawned detached (via a throwaway shell that exits at once) so its parent
+  # is not this test process — a direct child would be skipped as "our own".
+  fake=$(bash -c 'exec -a "bash /somewhere/hfget download org/model-a /dest" sleep 20 >/dev/null 2>&1 & echo $!')
+  sleep 0.3
+  # Call from a fresh child shell, as real hfget runs: the orphaned fake gets
+  # reparented to a reaper that may be this very test process, and a caller
+  # rightly ignores its own children.
+  all=$(bash -c "source '$HFGET'; foreign_hfget_pids")
+  [[ " $all " == *" $fake "* ]]
+  mine=$(bash -c "source '$HFGET'; foreign_hfget_pids org/model-a")
+  [[ " $mine " == *" $fake "* ]]
+  other=$(bash -c "source '$HFGET'; foreign_hfget_pids org/model")   # a prefix must not match
+  [[ " $other " != *" $fake "* ]]
+  kill "$fake" 2>/dev/null || true
 }
 
 # ------------------------------------------------------------ queue ops -----

@@ -4,6 +4,81 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and the project uses the
 `VERSION` string in the `hfget` script as the source of truth.
 
+## [2.9.0] — 2026-09-02
+
+Is it safe to load? hfget now acts on HuggingFace's malware/pickle scanners.
+
+### Added
+- **Scanner gate before every fetch.** `download`, `add` and `update` ask the
+  Hub's security scanners about the repo (one small call to
+  `/api/models/<id>/scan`) and **refuse to fetch flagged files** — exit code
+  `2`, before the destination directory is created. `add` rejects such a model
+  instead of queueing it (like gated repos); `update` gates only what it would
+  fetch. `--allow-unsafe` overrides with a loud warning and is stored in queue
+  entries like any other option. The check fails open (warn, continue) if the
+  scan status can't be read, and `HFGET_SCAN=off` skips it.
+- **`hfget scan <org/model>`** — per-file verdicts (safe / FLAGGED / pending)
+  with the dangerous pickle imports the scanners found, each file's format
+  class, and a plain-English note on formats that can run code when loaded.
+  Accepts `-r`/`-i`/`-x`/`-t`. Exit `2` when anything is flagged.
+- **`hfget audit [base-dir] [--offline]`** — one table of every managed model:
+  size, when it was fetched, the filter and revision it was fetched with, the
+  weight formats really on disk, and the current verdict (refreshed with one
+  call per model, or as recorded with `--offline`). Formats are judged by the
+  first bytes of each weight file, not its name, so a **hidden pickle** (a
+  `.safetensors`/`.gguf` whose bytes are a pickle) is called out. Exit `2` when
+  anything is flagged.
+- **Verdict provenance in the manifest** (`scan=clear|partial|flagged|unknown`
+  in the header). `update` re-checks files already on disk every run and
+  reports *"this repo was clear when you fetched it on <date>"* when the
+  scanners flag something later.
+- Pre-flight now prints a `safety:` line, and `--list` marks flagged files
+  with `!`.
+- `--help` documents exit codes (`0`, `1`, `2`, `130`).
+
+### Fixed
+- `update` crashed on macOS's bash 3.2 (`INCLUDES[*]: unbound variable`) when
+  a model's recorded filter contained only `-x`/`--exclude` globs.
+- `update --all`, `outdated` and `audit` now also find models with a bare id
+  (e.g. `gpt2`, stored as `<base>/gpt2/`); previously only `<org>/<model>`
+  directories were discovered.
+- **`-y`/`HFGET_YES` never deletes.** It used to auto-answer the stale-file
+  prompt of `update` with *yes*, silently turning `-y` into `--prune`. Stale
+  files are now kept unless `--prune` is given explicitly.
+- **`update --require-mount` was accepted and ignored.** It is now enforced,
+  and the macOS "`/Volumes/...` resolves to the local disk" warning that only
+  `download` had is shown by `update`, `outdated` and `audit` too — an
+  unmounted share can no longer make `update --all` fill the boot disk quietly.
+- Pruning/backing up the last file in a subfolder used `rmdir -p`, which kept
+  climbing and could remove an emptied model dir, org dir or even the base dir.
+  Cleanup now stops at the model dir.
+- **Two writers on the same model.** `download` refuses to start when another
+  hfget (typically the queue runner's child) is already downloading that model,
+  and `update` skips it — previously both would append into the same `.part`
+  files and corrupt them silently.
+- `add` of a model sitting in the failed list now re-queues it and dismisses
+  the failed copy instead of leaving the same model in both lists.
+- `outdated` reported "update available" forever for a manifest whose commit
+  could not be recorded; such models are now listed as unchecked with a hint.
+- A relative base dir ending in `/` (`hfget add org/model models/`) is
+  recognised as the destination (and stored absolute in the queue) instead of
+  being tried as a model id.
+- Queue progress with `-j > 1`: the reporter now sums every in-flight file
+  (and names the oldest, "+N more") instead of tracking only the last one
+  started; failed files no longer count as in flight.
+- The progress reporter exits when the runner dies (e.g. `kill -9`) instead of
+  looping forever; the runner start-up check waits up to 5 s instead of a
+  fixed 1 s (no more spurious "runner did not start" under load); the queue
+  lock reclaims a holder that died between creating the lock and writing its
+  pid instead of spinning for 30 s.
+- `--help` now says that `--rehash` implies `--verify`, and documents
+  `HF_HOME`; README documents `--no-start`, `clear --failed` and `rm <model>`.
+
+### Changed
+- CI: shellcheck also covers `install.sh`, jobs have timeouts, and the macOS
+  unit job runs the suite a second time under the system bash 3.2 explicitly.
+  Unit tests always run against a throwaway state dir, never `~/.hfget`.
+
 ## [2.8.1] — 2026-08-24
 
 ### Added

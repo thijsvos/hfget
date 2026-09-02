@@ -14,10 +14,11 @@ jobs:
   shellcheck:
     name: shellcheck
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Run shellcheck
-        run: shellcheck hfget
+        run: shellcheck hfget install.sh
 
   unit:
     name: unit (${{ matrix.os }})
@@ -26,6 +27,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install bats + jq
@@ -39,10 +41,20 @@ jobs:
         run: bash --version
       - name: Run unit tests
         run: bats tests/unit.bats
+      # macOS ships bash 3.2 at /bin/bash, the project's hard compatibility
+      # floor; Homebrew may put a newer bash first on PATH, so run the suite
+      # once more with the system bash resolved first.
+      - name: Run unit tests under the system bash 3.2 (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          export PATH="/bin:/usr/bin:$PATH"
+          bash --version | head -n 1
+          bats tests/unit.bats
 
   integration:
     name: integration (network)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install bats + jq

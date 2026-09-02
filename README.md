@@ -43,6 +43,12 @@ pending:
   with `--include`/`--exclude`.
 - **Gated-model aware** — detects gated/private repos up front with clear
   license/token instructions instead of failing halfway.
+- **Won't fetch what HuggingFace's scanners flagged** — before every download,
+  queue entry and update, hfget asks the Hub's malware/pickle scanners about the
+  repo and refuses flagged files (`--allow-unsafe` overrides). `hfget scan`
+  shows per-file verdicts and formats before you commit; `hfget audit` lists
+  everything on your disk, what format it really is, and whether it is still
+  clear.
 - **Cross-platform** — macOS and Linux, bash 3.2+.
 
 ## Requirements
@@ -101,11 +107,11 @@ Pasted URLs work too: `hfget download https://huggingface.co/Qwen/Qwen3-8B`.
 ## The queue
 
 ```sh
-hfget add <model...> [options]   # enqueue (+ auto-start the background runner)
+hfget add <model...> [options]   # enqueue (+ auto-start the background runner; --no-start to skip)
 hfget queue [seconds]            # LIVE watch (default refresh: 1s); Ctrl-C to exit
 hfget status                     # one-shot snapshot (good for scripts)
-hfget rm <n|model>               # remove a pending entry
-hfget clear [--all]              # drop pending; --all wipes everything + stops runner
+hfget rm <n|model>               # remove a pending entry (by id: also a failed one)
+hfget clear [--all|--failed]     # drop pending; --failed dismisses failures; --all wipes everything + stops runner
 hfget retry                      # re-queue failed entries
 hfget stop [--now]               # stop after current model / immediately (resumable)
 hfget run                        # process the queue in the foreground
@@ -167,6 +173,41 @@ update of a folder that predates manifests. Set `HFGET_NO_MANIFEST=1` to skip
 writing the manifest (updates then fall back to size-only comparison, and
 pruning is disabled for safety).
 
+## Is it safe to load?
+
+A model file is not just bytes: **pickle-based formats** (`.bin`, `.pt`, `.pth`,
+`.ckpt`, `.pkl`) execute code when a program loads them, and HuggingFace runs
+malware and pickle scanners over every repo — but the Hub only *marks* a file
+`unsafe`; it never stops you (or a downloader) from fetching it. hfget acts on
+those verdicts:
+
+- **Every fetch is gated.** `download`, `add` and `update` ask the Hub's scanners
+  about the repo first (one small API call) and refuse to fetch flagged files —
+  exit code `2`, and nothing is created on disk. `add` rejects such a model
+  instead of queueing it, the same way it rejects gated repos. Pass
+  `--allow-unsafe` if you understand the risk and want it anyway.
+- **The verdict travels with the data.** The manifest records it, and `update`
+  re-checks: a repo that turned bad *after* you first fetched it — or a file the
+  scanners only later learned to flag — is reported as *"was clear when you
+  fetched it on …"*.
+- **Plain-English format notes.** Pre-flight tells you when the selection
+  contains files that can run code, and suggests `.safetensors`/`.gguf` when the
+  author offers them.
+
+```sh
+hfget scan InstantX/InstantID           # per-file: size, format, verdict, dangerous pickle imports
+hfget audit ~/models                    # everything on disk: size, fetched when, filter, formats, verdict
+hfget audit ~/models --offline          # same, from what was recorded at fetch time (no network)
+```
+
+`audit` classifies files by their **bytes**, not their names — a file called
+`model.safetensors` whose content is a pickle is reported as a *hidden pickle*.
+Both commands exit `2` when anything is flagged, so they work in scripts. Set
+`HFGET_SCAN=off` to skip the scanner check entirely (e.g. an offline mirror).
+
+hfget itself never runs anything it downloads; these checks tell you what you
+are about to trust before another program loads it.
+
 ## Why hfget?
 
 The official `hf` CLI and other downloaders work well, but hfget fills a
@@ -180,6 +221,7 @@ specific niche:
 | Straight to any dir, no cache | ✅ | needs flags | ✅ | ✅ |
 | Size/quant confirmation | ✅ | — | — | partial |
 | Incremental update + prune | ✅ | partial | — | — |
+| Refuses scanner-flagged files; audits what's on disk | ✅ | — | — | — |
 | Resumable | ✅ | ✅ | ✅ | ✅ |
 
 If you want to line up a dozen models and let them trickle onto a NAS or big
@@ -201,6 +243,7 @@ shows up in `ps`.
 |---|---|
 | `HFGET_DEST` | default download dir (legacy alias: `HF_NAS_DIR`) |
 | `HF_TOKEN` | access token for gated/private models |
+| `HF_HOME` | where the official CLI keeps its token file (`$HF_HOME/token`, default `~/.cache/huggingface`) — read when `HF_TOKEN` is unset |
 | `HFGET_STATE_DIR` | queue state dir (default: `$XDG_STATE_HOME/hfget` or `~/.hfget`) |
 | `HFGET_WARN_GB` | size (GB) above which confirmation defaults to No (default 100) |
 | `HFGET_YES` | skip confirmation prompts (same as `-y`) |
@@ -210,6 +253,16 @@ shows up in `ps`.
 | `HFGET_QUEUE_NOWAIT` | the runner doesn't wait for a manual download in progress |
 | `HFGET_NOCAFFEINE` | don't keep the machine awake (macOS) |
 | `HFGET_NO_MANIFEST` | don't write the per-model `.hfget/manifest.tsv` (update/outdated fall back to size-only) |
+| `HFGET_SCAN` | `off` skips the HuggingFace scanner check before fetching (default: on) |
+
+## Exit codes
+
+| Code | Meaning |
+|---|---|
+| `0` | success |
+| `1` | error, or aborted at a confirmation prompt |
+| `2` | refused: a file to fetch is flagged by HuggingFace's scanners (`download`/`update`), or something is flagged (`scan`/`audit`) |
+| `130` | interrupted (Ctrl-C) — partial files are kept and resume |
 
 ## Troubleshooting
 
@@ -219,6 +272,7 @@ shows up in `ps`.
 | Download refused with `--require-mount` | The destination isn't a network mount; drop the flag for a local dir. |
 | Warning about `/Volumes/... resolves to the local disk` (macOS) | The NAS share isn't mounted; mount it first, or you'll fill the local disk. |
 | `HTTP 401/403` | Gated/private repo — accept the license and supply a token. |
+| `refusing to download … flagged by HuggingFace's malware/pickle scanners` | The Hub flagged a file in that repo. See `hfget scan <model>`; exclude the file (`-x`), pick a `.safetensors` variant, or, if you accept the risk, add `--allow-unsafe`. |
 | `Operation not permitted` on a network volume (macOS) | Grant your terminal access to network volumes in System Settings → Privacy & Security → Files and Folders. |
 
 ## Contributing

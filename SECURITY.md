@@ -24,5 +24,26 @@ issue. You can expect an initial response within a few days.
 ## Scope
 
 hfget downloads files from `huggingface.co` over HTTPS. It executes no model
-code and runs nothing it downloads. Review any model you download before using
-it in your own tooling.
+code and runs nothing it downloads.
+
+## What hfget does about the content of a model
+
+Model files can carry code: pickle-based formats (`.bin`, `.pt`, `.pth`,
+`.ckpt`, `.pkl`) execute it when a program loads them. hfget cannot make such a
+file safe, but it makes sure you know what you are about to trust:
+
+- Before every `download`, `add` and `update` it queries HuggingFace's
+  malware/pickle scanners for the repo and **refuses flagged files** (exit code
+  `2`) unless `--allow-unsafe` is given. This is a gate on the Hub's verdict,
+  not an independent scan: files the Hub has not scanned yet, or that evade
+  its scanners, pass with a "not yet scanned"/format warning.
+- `hfget scan` shows per-file verdicts and the dangerous pickle imports the
+  scanners found; `hfget audit` re-checks everything on disk and identifies
+  formats by their bytes, so a pickle hiding behind a `.safetensors` name is
+  reported.
+- Verdicts are recorded in the manifest, and `update` reports a repo that was
+  clear when fetched but is flagged now.
+
+Review any model you download before loading it in your own tooling, and
+prefer `.safetensors`/`.gguf` over pickle-based files whenever the author
+offers them.
