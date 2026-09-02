@@ -4,6 +4,26 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and the project uses the
 `VERSION` string in the `hfget` script as the source of truth.
 
+## [2.9.1] — 2026-09-02
+
+Documentation release — no behaviour changes.
+
+### Fixed
+- `--help` was wrong in several places: the exit-code list (`2` is produced
+  only by `download`, `scan` and `audit` — `audit` also for a hidden pickle;
+  `update` reports a refused model as `1`; `add` skips a flagged model and
+  exits `0`; Ctrl-C in `queue` exits `0`), the `update` option list (it also
+  takes `--require-mount`, `--allow-unsafe`, `-n`, `-y`) and its
+  manifest-filter inheritance, `-t` on `audit`/`outdated`, `retry` also
+  starting the runner, the scope of `HFGET_QUEUE_NOSTART`/`HFGET_NO_MANIFEST`,
+  the queue state-dir heading, the `--list` markers, the `-j` range and
+  `clear`'s short flags. README exit-code table aligned.
+- Every function in the script now carries an accurate comment block: the
+  `fetch_one` contract had ended up above `mark_fail`, and comments on
+  `fetch_tree`, `progress_reporter`, `read_manifest_header`, `write_manifest`,
+  `assert_safe_paths`, `sniff_format`, `cmd_audit` and the file headers
+  described pre-2.9 behaviour.
+
 ## [2.9.0] — 2026-09-02
 
 Is it safe to load? hfget now acts on HuggingFace's malware/pickle scanners.

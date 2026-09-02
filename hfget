@@ -22,7 +22,7 @@
 if [[ "${BASH_SOURCE[0]}" != "${0}" ]]; then HFGET_SOURCED=1; else HFGET_SOURCED=0; fi
 [[ $HFGET_SOURCED -eq 1 ]] || set -euo pipefail
 
-VERSION="2.9.0"
+VERSION="2.9.1"
 HF="https://huggingface.co"
 # State dir: explicit override > XDG state home > ~/.hfget
 if [[ -n ${HFGET_STATE_DIR:-} ]]; then QDIR=$HFGET_STATE_DIR
