@@ -95,7 +95,7 @@ teardown() {
   [ "$before" = "$after" ]        # unrelated file not rewritten
 }
 
-@test "stale file: default keeps it, --prune removes it" {
+@test "stale file: default keeps it, -y keeps it too, --prune removes it" {
   "$HFGET" download "$TINY" "$DEST" -y
   mf="$DEST/$TINY/.hfget/manifest.tsv"
   printf 'STALE' > "$DEST/$TINY/removed_upstream.bin"
@@ -103,9 +103,62 @@ teardown() {
   # non-interactive default is No -> kept
   "$HFGET" update "$TINY" "$DEST"
   [ -f "$DEST/$TINY/removed_upstream.bin" ]
-  # --prune removes it
+  # -y skips prompts but must never delete
+  run "$HFGET" update "$TINY" "$DEST" -y
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"-y never deletes"* ]]
+  [ -f "$DEST/$TINY/removed_upstream.bin" ]
+  # --prune removes it — and the emptied dir cleanup never climbs past the model dir
   "$HFGET" update "$TINY" "$DEST" --prune
   [ ! -f "$DEST/$TINY/removed_upstream.bin" ]
+  [ -d "$DEST/$TINY" ]
+}
+
+@test "update honors --require-mount (a local dir is refused before any network call)" {
+  run "$HFGET" update "$TINY" "$DEST" --require-mount
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"--require-mount"*"not on a network mount"* ]]
+}
+
+@test "outdated treats a manifest without a recorded commit as unchecked, not as an update" {
+  "$HFGET" download "$TINY" "$DEST" -y
+  mf="$DEST/$TINY/.hfget/manifest.tsv"
+  sed 's/commit=[0-9a-f]*/commit=/' "$mf" > "$mf.t" && mv "$mf.t" "$mf"
+  run "$HFGET" outdated "$DEST"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"no commit recorded"* ]]
+  [[ "$output" != *"update available"* ]]
+  [[ "$output" == *"1 unchecked"* ]]
+}
+
+@test "add accepts a relative base dir ending in / and stores it absolute" {
+  export HFGET_QUEUE_NOSTART=1
+  cd "$(dirname "$DEST")"
+  run "$HFGET" add "$TINY" "$(basename "$DEST")/" -y
+  [ "$status" -eq 0 ]
+  grep -q "^$TINY	.*	$DEST\$" "$STATE/queue.tsv"
+}
+
+@test "add re-queues a model from the failed list and dismisses the failed copy" {
+  export HFGET_QUEUE_NOSTART=1
+  mkdir -p "$STATE"
+  printf '%s\t2026-01-01T00:00:00Z\t%s\n' "$TINY" "$DEST" > "$STATE/failed.tsv"
+  run "$HFGET" add "$TINY" "$DEST" -y
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"failed list"* ]]
+  [ ! -s "$STATE/failed.tsv" ]
+  [ "$(grep -c "^$TINY" "$STATE/queue.tsv")" = "1" ]
+}
+
+@test "download refuses to be a second writer on a model another hfget is fetching" {
+  bash -c "exec -a 'bash /elsewhere/hfget download $TINY /some/dest' sleep 30" &
+  fake=$!
+  sleep 0.3
+  run "$HFGET" download "$TINY" "$DEST" -y
+  kill "$fake" 2>/dev/null || true; wait "$fake" 2>/dev/null || true
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"another hfget is already downloading"* ]]
+  [ ! -d "$DEST/$TINY" ]
 }
 
 @test "update --dry-run does not write a manifest" {

@@ -5,8 +5,16 @@
 
 setup() {
   HFGET="${BATS_TEST_DIRNAME}/../hfget"
+  # Never let a test touch the developer's real ~/.hfget: point the queue
+  # state at a throwaway dir BEFORE sourcing (QDIR is derived at source time).
+  UNIT_STATE="$(mktemp -d)"
+  export HFGET_STATE_DIR="$UNIT_STATE" HFGET_NOCAFFEINE=1
   # shellcheck disable=SC1090
   source "$HFGET"
+}
+
+teardown() {
+  [ -n "${UNIT_STATE:-}" ] && rm -rf "$UNIT_STATE"
 }
 
 @test "human formats byte counts" {
@@ -322,6 +330,56 @@ setup() {
   [[ "$output" == *"filter *.safetensors"* ]]
   [[ "$output" == *"1 FLAGGED"* ]]
   rm -rf "$base"
+}
+
+@test "rmdir_upto removes emptied dirs below the model dir but never the model dir or above" {
+  base="$(mktemp -d)"; dest="$base/org/model"
+  mkdir -p "$dest/a/b/c" "$dest/a/other"
+  rmdir_upto "$dest" "$dest/a/b/c"
+  [ ! -d "$dest/a/b" ]          # emptied chain removed
+  [ -d "$dest/a" ]              # sibling keeps this one alive
+  rmdir "$dest/a/other"
+  rmdir_upto "$dest" "$dest/a"
+  [ ! -d "$dest/a" ]
+  [ -d "$dest" ]                # the model dir itself survives even when empty
+  rmdir_upto "$dest" "$base/org"   # outside the top: refused
+  [ -d "$base/org" ]
+  rm -rf "$base"
+}
+
+@test "dest_safety_nets honors --require-mount and warns on the /Volumes trap" {
+  d="$(mktemp -d)"
+  REQUIRE_MOUNT=0
+  run dest_safety_nets "$d" 1
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+  REQUIRE_MOUNT=1
+  run dest_safety_nets "$d" 1
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"--require-mount"*"not on a network mount"* ]]
+  REQUIRE_MOUNT=0
+  run dest_safety_nets "/Volumes/definitely-not-mounted-$$" 0
+  [ "$status" -eq 0 ]
+  if [ "$(uname)" = "Darwin" ]; then
+    [[ "$output" == *"resolves to the local disk"* ]]
+    [[ "$output" != *"--require-mount"* ]]   # commands without the flag don't advertise it
+  fi
+  rm -rf "$d"
+}
+
+@test "foreign_hfget_pids can be narrowed to one model id" {
+  # Fake another 'hfget download' of a model: argv[0] is what ps shows.
+  bash -c 'exec -a "bash /somewhere/hfget download org/model-a /dest" sleep 20' &
+  fake=$!
+  sleep 0.3
+  all=$(foreign_hfget_pids)
+  [[ " $all " == *" $fake "* ]]
+  mine=$(foreign_hfget_pids "org/model-a")
+  [[ " $mine " == *" $fake "* ]]
+  other=$(foreign_hfget_pids "org/model")          # a prefix must not match
+  [[ " $other " != *" $fake "* ]]
+  kill "$fake" 2>/dev/null || true
+  wait "$fake" 2>/dev/null || true
 }
 
 # ------------------------------------------------------------ queue ops -----

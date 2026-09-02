@@ -42,6 +42,42 @@ Is it safe to load? hfget now acts on HuggingFace's malware/pickle scanners.
 - `update --all`, `outdated` and `audit` now also find models with a bare id
   (e.g. `gpt2`, stored as `<base>/gpt2/`); previously only `<org>/<model>`
   directories were discovered.
+- **`-y`/`HFGET_YES` never deletes.** It used to auto-answer the stale-file
+  prompt of `update` with *yes*, silently turning `-y` into `--prune`. Stale
+  files are now kept unless `--prune` is given explicitly.
+- **`update --require-mount` was accepted and ignored.** It is now enforced,
+  and the macOS "`/Volumes/...` resolves to the local disk" warning that only
+  `download` had is shown by `update`, `outdated` and `audit` too — an
+  unmounted share can no longer make `update --all` fill the boot disk quietly.
+- Pruning/backing up the last file in a subfolder used `rmdir -p`, which kept
+  climbing and could remove an emptied model dir, org dir or even the base dir.
+  Cleanup now stops at the model dir.
+- **Two writers on the same model.** `download` refuses to start when another
+  hfget (typically the queue runner's child) is already downloading that model,
+  and `update` skips it — previously both would append into the same `.part`
+  files and corrupt them silently.
+- `add` of a model sitting in the failed list now re-queues it and dismisses
+  the failed copy instead of leaving the same model in both lists.
+- `outdated` reported "update available" forever for a manifest whose commit
+  could not be recorded; such models are now listed as unchecked with a hint.
+- A relative base dir ending in `/` (`hfget add org/model models/`) is
+  recognised as the destination (and stored absolute in the queue) instead of
+  being tried as a model id.
+- Queue progress with `-j > 1`: the reporter now sums every in-flight file
+  (and names the oldest, "+N more") instead of tracking only the last one
+  started; failed files no longer count as in flight.
+- The progress reporter exits when the runner dies (e.g. `kill -9`) instead of
+  looping forever; the runner start-up check waits up to 5 s instead of a
+  fixed 1 s (no more spurious "runner did not start" under load); the queue
+  lock reclaims a holder that died between creating the lock and writing its
+  pid instead of spinning for 30 s.
+- `--help` now says that `--rehash` implies `--verify`, and documents
+  `HF_HOME`; README documents `--no-start`, `clear --failed` and `rm <model>`.
+
+### Changed
+- CI: shellcheck also covers `install.sh`, jobs have timeouts, and the macOS
+  unit job runs the suite a second time under the system bash 3.2 explicitly.
+  Unit tests always run against a throwaway state dir, never `~/.hfget`.
 
 ## [2.8.1] — 2026-08-24
 

@@ -107,7 +107,7 @@ Pasted URLs work too: `hfget download https://huggingface.co/Qwen/Qwen3-8B`.
 ## The queue
 
 ```sh
-hfget add <model...> [options]   # enqueue (+ auto-start the background runner)
+hfget add <model...> [options]   # enqueue (+ auto-start the background runner; --no-start to skip)
 hfget queue [seconds]            # LIVE watch (default refresh: 1s); Ctrl-C to exit
 hfget status                     # one-shot snapshot (good for scripts)
 hfget rm <n|model>               # remove a pending entry (by id: also a failed one)
@@ -243,6 +243,7 @@ shows up in `ps`.
 |---|---|
 | `HFGET_DEST` | default download dir (legacy alias: `HF_NAS_DIR`) |
 | `HF_TOKEN` | access token for gated/private models |
+| `HF_HOME` | where the official CLI keeps its token file (`$HF_HOME/token`, default `~/.cache/huggingface`) — read when `HF_TOKEN` is unset |
 | `HFGET_STATE_DIR` | queue state dir (default: `$XDG_STATE_HOME/hfget` or `~/.hfget`) |
 | `HFGET_WARN_GB` | size (GB) above which confirmation defaults to No (default 100) |
 | `HFGET_YES` | skip confirmation prompts (same as `-y`) |

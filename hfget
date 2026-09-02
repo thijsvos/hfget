@@ -81,7 +81,8 @@ Download now (foreground):
       --force-local    accepted for compatibility; now a no-op (local is default)
       --allow-unsafe   fetch files even if HuggingFace's security scanners
                        flagged them (default: refuse, exit code 2)
-  -y, --yes            skip the size-confirmation prompt
+  -y, --yes            skip the size-confirmation prompt (never deletes:
+                       removing stale files on 'update' needs --prune)
 
 Check before you trust (foreground):
   hfget scan <org/model> [options]
@@ -133,7 +134,8 @@ Keep models current (foreground):
       --keep           never remove stale files (only add/replace)
       --backup         move stale files to <dest>/.hfget-old/<date>/ instead
       --rehash         hash local files to catch same-size changes exactly
-                       (useful for the first update of a pre-manifest dir)
+                       (useful for the first update of a pre-manifest dir;
+                       implies --verify for the files it then fetches)
   hfget outdated [base-dir]
                        list which managed models under the base dir have an
                        upstream update (one quick check each; no downloads)
@@ -159,6 +161,8 @@ Environment:
   HFGET_DEST           default download dir (e.g. "$HOME/models")
   HF_NAS_DIR           legacy alias for HFGET_DEST (still honored)
   HF_TOKEN             HF access token for gated/private models
+  HF_HOME              where the hf CLI keeps its token file ($HF_HOME/token;
+                       default ~/.cache/huggingface) — read when HF_TOKEN is unset
   HFGET_STATE_DIR      queue state dir (default: $XDG_STATE_HOME/hfget or ~/.hfget)
   HFGET_QUEUE_NOSTART  if set, 'add' never auto-starts the runner
   HFGET_QUEUE_NOWAIT   if set, the runner does not wait for manual downloads
@@ -229,6 +233,46 @@ file_birth() {
 }
 
 enc_path() { jq -rn --arg p "$1" '$p | split("/") | map(@uri) | join("/")'; }
+
+need_val() { [[ $# -ge 2 ]] || die "option $1 requires a value"; }
+
+# Destination safety nets shared by download/update/outdated/audit. Sets
+# DEST_PROBE (nearest existing ancestor of $1), FS_DEV and IS_NETMOUNT. Two
+# targeted checks — any destination is allowed by default:
+#  1. --require-mount (REQUIRE_MOUNT=1): opt-in strictness for NAS workflows.
+#  2. macOS /Volumes trap: a /Volumes/<share> path that resolves to the boot
+#     disk means the share isn't mounted — writing there fills the local disk.
+# $2 = 1 when the calling command accepts --require-mount (for the hint).
+dest_safety_nets() {
+  local base=$1 has_flag=${2:-0} hint=''
+  DEST_PROBE=$base
+  while [[ ! -d $DEST_PROBE && $DEST_PROBE != / && $DEST_PROBE != . ]]; do DEST_PROBE=$(dirname "$DEST_PROBE"); done
+  FS_DEV=$(df -P "$DEST_PROBE" 2>/dev/null | awk 'NR == 2 { print $1 }')
+  IS_NETMOUNT=0
+  case "$FS_DEV" in //* | *:*) IS_NETMOUNT=1 ;; esac  # SMB/AFP (//host/share) or NFS (host:/export)
+  if [[ ${REQUIRE_MOUNT:-0} -eq 1 && $IS_NETMOUNT -eq 0 ]]; then
+    die "--require-mount: destination '$base' is not on a network mount (filesystem: ${FS_DEV:-unknown}).
+Mount the share first, or drop --require-mount to allow a local destination."
+  fi
+  if [[ $has_flag -eq 1 ]]; then hint=" (or pass --require-mount to make this an error)"; fi
+  case "$base" in
+    /Volumes/*)
+      if [[ $IS_NETMOUNT -eq 0 ]]; then
+        warn "'$base' is under /Volumes but resolves to the local disk ($FS_DEV) — the network share may not be mounted. Mount it first if you meant the NAS$hint."
+      fi ;;
+  esac
+}
+
+# Remove now-empty directories from $2 upward, stopping at $1 (never removing
+# $1 itself or anything outside it) — a bare `rmdir -p` keeps climbing past
+# the model dir and can take an emptied base dir with it.
+rmdir_upto() {
+  local top=$1 d=$2
+  while [[ $d != "$top" && $d == "$top"/* ]]; do
+    rmdir "$d" 2>/dev/null || break
+    d=$(dirname "$d")
+  done
+}
 
 matches_any() {
   local p=$1 g
@@ -608,8 +652,6 @@ MODEL='' BASE='' REV='main' TOKEN=''
 LIST=0 DRYRUN=0 JOBS=1 VERIFY=0 REQUIRE_MOUNT=0 ALLOW_UNSAFE=0
 INCLUDES=() EXCLUDES=()
 
-need_val() { [[ $# -ge 2 ]] || die "option $1 requires a value"; }
-
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -r|--revision)  need_val "$@"; REV=$2; shift 2 ;;
@@ -697,26 +739,8 @@ fi
 if [[ -z $BASE ]]; then BASE=${HFGET_DEST:-${HF_NAS_DIR:-}}; fi
 [[ -n $BASE ]] || die "no destination: pass a base dir as the 2nd argument, or set HFGET_DEST (e.g. export HFGET_DEST=\"\$HOME/models\")"
 
-probe=$BASE
-while [[ ! -d $probe && $probe != / && $probe != . ]]; do probe=$(dirname "$probe"); done
-fs_dev=$(df -P "$probe" 2>/dev/null | awk 'NR == 2 { print $1 }')
-is_netmount=0
-case "$fs_dev" in //* | *:*) is_netmount=1 ;; esac  # SMB/AFP (//host/share) or NFS (host:/export)
-
-# Any destination is allowed by default. Two targeted safety nets:
-#  1. --require-mount: opt-in strictness for NAS workflows.
-if [[ $REQUIRE_MOUNT -eq 1 && $is_netmount -eq 0 ]]; then
-  die "--require-mount: destination '$BASE' is not on a network mount (filesystem: ${fs_dev:-unknown}).
-Mount the share first, or drop --require-mount to allow a local destination."
-fi
-#  2. macOS /Volumes trap: a /Volumes/<share> path that resolves to the boot
-#     disk means the share isn't mounted — writing there fills the local disk.
-case "$BASE" in
-  /Volumes/*)
-    if [[ $is_netmount -eq 0 ]]; then
-      warn "'$BASE' is under /Volumes but resolves to the local disk ($fs_dev) — the network share may not be mounted. Mount it first if you meant the NAS (or pass --require-mount to make this an error)."
-    fi ;;
-esac
+dest_safety_nets "$BASE" 1
+probe=$DEST_PROBE; fs_dev=$FS_DEV
 
 # NB: the destination directory is created only after ALL pre-flight checks
 # pass (auth probe included), so a refused or dry-run download leaves nothing
@@ -789,6 +813,14 @@ if ! size_guard "$need_bytes" "download"; then
   die "aborted — nothing was downloaded"
 fi
 
+# Never be the second writer on the same files: another hfget (typically the
+# queue runner's child) already downloading this model would interleave bytes
+# into the same .part files.
+busy=$(foreign_hfget_pids "$MODEL")
+if [[ -n $busy ]]; then
+  die "another hfget is already downloading $MODEL (pid $busy) — two writers would corrupt the same files. Watch it with 'hfget queue', or stop it first (hfget stop --now)"
+fi
+
 # All checks passed — only now touch the filesystem.
 if ! mkdir -p "$DEST" 2>"$TMPD/mkdir.err"; then
   mkdir_err=$(cat "$TMPD/mkdir.err" 2>/dev/null || true)
@@ -811,8 +843,9 @@ DEST_REAL=$(cd "$DEST" && pwd -P)
 # ---------------------------------------------------------------- download --
 # When the queue runner set HFGET_PROG, log exact byte progress there so the
 # watcher can show a real percentage: T = total bytes this run must download,
-# C = file now in flight (size, resume offset, path), F = bytes a finished
-# file contributed.
+# C = a file now in flight (size, resume offset, path), F = bytes a finished
+# file contributed (+ its path, so the reporter knows it is no longer in flight
+# — with -j > 1 several files are).
 PROGF=${HFGET_PROG:-}
 if [[ -n $PROGF ]]; then printf 'T\t%s\n' "$need_bytes" > "$PROGF"; fi
 
@@ -885,12 +918,20 @@ q_init() {
 }
 
 q_lock() {
-  local tries=0 lpid
+  local tries=0 lpid empty=0
   until mkdir "$LOCKD" 2>/dev/null; do
     lpid=$(cat "$LOCKD/pid" 2>/dev/null || true)
     if [[ -n $lpid ]] && ! kill -0 "$lpid" 2>/dev/null; then
       rm -rf "$LOCKD"
       continue
+    fi
+    # The holder writes its pid right after mkdir; a pid file that stays
+    # empty for 2 s means it died in that window — reclaim rather than spin.
+    if [[ -z $lpid ]]; then
+      empty=$((empty + 1))
+      if [[ $empty -gt 10 ]]; then rm -rf "$LOCKD"; empty=0; continue; fi
+    else
+      empty=0
     fi
     tries=$((tries + 1))
     if [[ $tries -gt 150 ]]; then die "queue lock is stuck ($LOCKD) — remove it if no hfget is running"; fi
@@ -925,13 +966,16 @@ parse_entry() {
 # Pids of *foreground* hfget downloads that are NOT this process or its child.
 # Matches the specific "<script> download" invocation, so merely viewing state
 # files (tail/less on ~/.hfget/*, an editor on the script) is not mistaken for a
-# running download and can't stall the runner.
+# running download and can't stall the runner. With $1 = a model id, only
+# downloads of that model (so a second writer on the same files can be refused).
 foreign_hfget_pids() {
-  local name
+  local name model_re=''
   name=$(basename "$SELF")
-  ps -axww -o pid,ppid,command | awk -v me="$$" -v child="${RUN_CHILD:-0}" -v name="$name" '
+  if [[ -n ${1:-} ]]; then model_re=$(printf '%s' "$1" | sed 's/[][\.*^$]/\\&/g'); fi
+  ps -axww -o pid,ppid,command | MODEL_RE=$model_re awk -v me="$$" -v child="${RUN_CHILD:-0}" -v name="$name" '
     $0 !~ ("(^|[ /])" name " download([ ]|$)") { next }
     /awk|grep/ { next }
+    ENVIRON["MODEL_RE"] != "" && $0 !~ ("[ /]" ENVIRON["MODEL_RE"] "([ ]|$)") { next }
     { pid = $1; ppid = $2 }
     pid == me || ppid == me { next }
     (child != 0) && (pid == child || ppid == child) { next }
@@ -947,7 +991,10 @@ q_maybe_start_runner() {
   rm -f "$SF"
   HFGET_CAFFEINATED='' nohup "$SELF" run --daemon >> "$RL" 2>&1 &
   disown 2>/dev/null || true
-  sleep 1
+  # The daemon re-execs under caffeinate (macOS) before it writes its pid
+  # file; give it up to 5 s rather than one fixed second under load.
+  local i=0
+  while [[ $i -lt 25 ]] && ! runner_alive; do sleep 0.2; i=$((i + 1)); done
   if runner_alive; then
     info "${C_GRN}background runner started${C_OFF} (pid $(cat "$RP")) — watch with: hfget queue"
   else
@@ -965,7 +1012,7 @@ cmd_add() {
   for a in "$@"; do
     if [[ $a == --no-start ]]; then nostart=1; continue; fi
     if [[ $a == -y || $a == --yes ]]; then YES=1; continue; fi
-    if [[ $parsing_models -eq 1 && $a != -* && $a != /* && $a != .* ]]; then
+    if [[ $parsing_models -eq 1 && $a != -* && $a != /* && $a != .* && $a != */ && $a != '~'* ]]; then
       normalize_model_id "$a"
       if [[ $NORM_MODEL =~ $MODEL_ID_RE ]]; then
         case "$NORM_UREV" in *$'\t'* | *$'\n'*) die "revision may not contain tabs or newlines: '$NORM_UREV'" ;; esac
@@ -1014,16 +1061,29 @@ cmd_add() {
   fi
 
   # Resolve the destination NOW and bake it into every entry, so a queued
-  # download can never fail later because the runner lacks HF_NAS_DIR.
-  local base='' base_from_env=0
+  # download can never fail later because the runner lacks HF_NAS_DIR (or
+  # runs from another working directory: a relative base dir is made absolute).
+  # A base dir is anything path-shaped: absolute, ./ ../ ~, or ending in "/".
+  local base='' base_from_env=0 qa=() expect_val=0
   for a in ${qargs[@]+"${qargs[@]}"}; do
-    case "$a" in /*) base=$a; break ;; esac
+    if [[ $expect_val -eq 1 ]]; then expect_val=0; qa+=("$a"); continue; fi
+    case "$a" in
+      -i|--include|-x|--exclude|-r|--revision|-j|--jobs) expect_val=1 ;;
+      /*|./*|../*|'~'*|*/)
+        [[ -z $base ]] || die "more than one base dir given ('$base' and '$a')"
+        a=${a%/}; [[ -n $a ]] || a=/
+        case "$a" in '~'*) a="$HOME${a#\~}" ;; esac
+        case "$a" in /*) ;; *) a="$PWD/${a#./}" ;; esac
+        base=$a ;;
+    esac
+    qa+=("$a")
   done
+  qargs=(${qa[@]+"${qa[@]}"})
   if [[ -z $base ]]; then
     base=${HFGET_DEST:-${HF_NAS_DIR:-}}
     base_from_env=1
   fi
-  [[ -n $base ]] || die "no destination: pass a base dir (e.g. hfget add <model> \"\$HOME/models\") or set HFGET_DEST — refusing to queue entries that would fail at download time"
+  [[ -n $base ]] || die "no destination: pass a base dir (absolute, or ending in '/', e.g. hfget add <model> \"\$HOME/models\") or set HFGET_DEST — refusing to queue entries that would fail at download time"
   case "$base" in *$'\t'* | *$'\n'*) die "destination path may not contain tabs or newlines: '$base'" ;; esac
   if [[ $base_from_env -eq 1 ]]; then
     qargs+=("$base")
@@ -1040,13 +1100,20 @@ cmd_add() {
 
   # Check every model against the API before it may enter the queue: size and
   # contents overview, gated-model detection, and a confirmation prompt.
-  local ts m rev pos line total count
+  local ts m rev pos line total count was_failed
   ts=$(date -u +%FT%TZ)
   for i in $(seq 0 $(( ${#models[@]} - 1 ))); do
     m=${models[$i]}
     if cut -f1 "$QF" "$CF" 2>/dev/null | grep -qxF "$m"; then
       warn "$m is already queued or downloading — skipped"
       continue
+    fi
+    # Re-adding a failed model means "try again": once it passes the checks
+    # below, the failed copy is dismissed so a model never sits in both lists.
+    was_failed=0
+    if cut -f1 "$FF" 2>/dev/null | grep -qxF "$m"; then
+      was_failed=1
+      info "$m is in the failed list — it will be queued fresh and that entry dismissed"
     fi
     rev=${prev_rev:-${mrevs[$i]:-}}
     if [[ -z $rev ]]; then rev=main; fi
@@ -1088,6 +1155,9 @@ cmd_add() {
       line=$(printf '%s\t%s' "$line" "$a")
     done
     q_lock
+    if [[ $was_failed -eq 1 ]]; then
+      awk -F '\t' -v m="$m" '$1 != m' "$FF" > "$FF.tmp" && mv "$FF.tmp" "$FF"
+    fi
     printf '%s\n' "$line" >> "$QF"
     pos=$(wc -l < "$QF" | tr -d ' ')
     q_unlock
@@ -1117,25 +1187,41 @@ CUR_ACTIVE=0
 # The watcher only ever reads that local file, so its redraws can never stall
 # on slow SMB metadata calls.
 progress_reporter() {
-  local d=$1 total fdone csize coff cpath ps gain prog pct
+  local d=$1 total fdone csize coff cpath ps gain g prog pct ninf first name
   while :; do
+    # Live only as long as the runner ($$ is the runner's pid even in this
+    # background subshell): a SIGKILLed runner must not leave this loop behind.
+    kill -0 "$$" 2>/dev/null || exit 0
     if [[ -s $CPF ]]; then
-      IFS=$'\t' read -r total fdone csize coff cpath <<< "$(awk -F '\t' '
+      # Line 1: total \t finished-bytes. Then one line per file still in
+      # flight (a C without its F): start-order \t size \t offset \t path.
+      awk -F '\t' '
         $1 == "T" { t = $2 }
-        $1 == "F" { f += $2 }
-        $1 == "C" { cs = $2; co = $3; cp = $4 }
-        END { printf "%d\t%d\t%d\t%d\t%s", t + 0, f + 0, cs + 0, co + 0, cp }' "$CPF")"
-      gain=0 ps=0
-      if [[ -n $cpath ]]; then
+        $1 == "F" { f += $2; done[$3] = 1 }
+        $1 == "C" { cs[$4] = $2; co[$4] = $3; if (!($4 in ord)) ord[$4] = ++n }
+        END {
+          printf "%d\t%d\n", t + 0, f + 0
+          for (p in cs) if (!(p in done)) printf "%d\t%d\t%d\t%s\n", ord[p], cs[p], co[p], p
+        }' "$CPF" > "$PGF.calc"
+      IFS=$'\t' read -r total fdone < <(head -n 1 "$PGF.calc")
+      gain=0 ps=0 ninf=0 first=''
+      while IFS=$'\t' read -r _ csize coff cpath; do   # oldest in-flight file first
+        [[ -n $cpath ]] || continue
+        ninf=$((ninf + 1))
         ps=$(filesize "$d/$cpath.part")
-        if [[ $ps -gt $coff ]]; then gain=$((ps - coff)); fi
-        if [[ $gain -gt $((csize - coff)) ]]; then gain=$((csize - coff)); fi
-      fi
+        g=0
+        if [[ $ps -gt $coff ]]; then g=$((ps - coff)); fi
+        if [[ $g -gt $((csize - coff)) ]]; then g=$((csize - coff)); fi
+        gain=$((gain + g))
+        if [[ -z $first ]]; then first=$cpath; fi
+      done < <(tail -n +2 "$PGF.calc" | sort -n)
       prog=$((fdone + gain))
       pct=0
-      if [[ $total -gt 0 ]]; then pct=$((prog * 100 / total)); fi
+      if [[ ${total:-0} -gt 0 ]]; then pct=$((prog * 100 / total)); fi
       if [[ $pct -gt 100 ]]; then pct=100; fi
-      printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$(date +%s)" "$pct" "$prog" "$total" "${cpath##*/}" "$ps" \
+      name=${first##*/}
+      if [[ $ninf -gt 1 ]]; then name="$name (+$((ninf - 1)) more)"; fi
+      printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$(date +%s)" "$pct" "$prog" "${total:-0}" "$name" "$ps" \
         > "$PGF.tmp" && mv -f "$PGF.tmp" "$PGF"
     else
       rm -f "$PGF"
@@ -1150,7 +1236,7 @@ stop_reporter() {
     wait "$RUN_REPORTER" 2>/dev/null || true
     RUN_REPORTER=0
   fi
-  rm -f "$PGF" "$PGF.tmp" "$CPF"
+  rm -f "$PGF" "$PGF.tmp" "$PGF.calc" "$CPF"
 }
 
 runner_requeue_current() {
@@ -1783,7 +1869,7 @@ prune_stale() {
     if [[ -z $fdir || ( $fdir != "$DEST_REAL" && $fdir != "$DEST_REAL"/* ) ]]; then
       warn "  refusing to remove outside the destination: $path"; continue
     fi
-    if rm -f "$f"; then removed=$((removed + 1)); rmdir -p "$(dirname "$f")" 2>/dev/null || true; fi
+    if rm -f "$f"; then removed=$((removed + 1)); rmdir_upto "$DEST" "$(dirname "$f")"; fi
   done < "$STALE_FINAL"
   info "  removed $removed stale file(s)"
 }
@@ -1798,7 +1884,7 @@ backup_stale() {
     [[ -e $f ]] || continue
     if [[ -L $f ]]; then continue; fi
     mkdir -p "$(dirname "$d")"
-    if mv -f "$f" "$d" 2>/dev/null; then moved=$((moved + 1)); rmdir -p "$(dirname "$f")" 2>/dev/null || true; fi
+    if mv -f "$f" "$d" 2>/dev/null; then moved=$((moved + 1)); rmdir_upto "$DEST" "$(dirname "$f")"; fi
   done < "$STALE_FINAL"
   info "  moved $moved stale file(s) → $base"
 }
@@ -1943,8 +2029,9 @@ update_one() {
     if [[ $stale_mode == keep ]]; then slabel="keep"
     elif [[ $stale_mode == backup ]]; then slabel="move to .hfget-old/"
     elif [[ $stale_mode == prune ]]; then slabel="remove"
-    elif [[ $have_manifest -eq 1 ]]; then slabel="ask, then remove"
-    else slabel="keep (no manifest yet)"; fi
+    elif [[ $have_manifest -eq 0 ]]; then slabel="keep (no manifest yet)"
+    elif [[ -n ${YES:-} ]]; then slabel="keep (-y never deletes; use --prune)"
+    else slabel="ask, then remove"; fi
     info "  stale:      $(printf '%4d' "$n_stale") file(s)  $(human "$b_stale")  — $slabel"
   fi
   info "  to fetch:   $(human "$need_bytes")"
@@ -2019,7 +2106,11 @@ update_one() {
       while IFS=$'\t' read -r sp ss sl sg; do
         info "  - $(printf '%-10s' "$(human "$ss")") $sp"
       done < "$STALE_FINAL"
-      if confirm "remove these $n_stale file(s) ($(human "$b_stale"))? (new/changed download first regardless)" n; then
+      # -y / HFGET_YES skips confirmations but must never turn into a delete:
+      # removing files is opt-in via --prune only.
+      if [[ -n ${YES:-} ]]; then
+        info "  keeping stale files (-y never deletes; pass --prune to remove them)"
+      elif confirm "remove these $n_stale file(s) ($(human "$b_stale"))? (new/changed download first regardless)" n; then
         do_prune=1
       else
         info "  keeping stale files"
@@ -2035,6 +2126,13 @@ update_one() {
       401|403) warn "$MODEL: downloads denied (HTTP $PROBE_CODE — gated/private; accept the license and pass a token) — skipping"; return 1 ;;
       *) warn "$MODEL: unexpected HTTP $PROBE_CODE probing the first file — attempting anyway" ;;
     esac
+  fi
+
+  local busy
+  busy=$(foreign_hfget_pids "$MODEL")
+  if [[ -n $busy ]]; then
+    warn "$MODEL: another hfget is downloading it right now (pid $busy) — skipping to avoid two writers on the same files"
+    return 1
   fi
 
   mkdir -p "$DEST" || { warn "$MODEL: cannot create $DEST — skipping"; return 1; }
@@ -2083,8 +2181,6 @@ cmd_update() {
   local do_all=0 rehash=0 stale_mode=ask a
   local models=() realmodels=()
 
-  need_val() { [[ $# -ge 2 ]] || die "option $1 requires a value"; }
-
   while [[ $# -gt 0 ]]; do
     case "$1" in
       -r|--revision)   need_val "$@"; REV_ARG=$2; REV_FORCED=1; shift 2 ;;
@@ -2115,10 +2211,12 @@ cmd_update() {
     die "--jobs must be a number between 1 and 16"
   fi
 
+  # A base dir is anything path-shaped: absolute, ./ ../ ~, or ending in "/"
+  # (so a relative dir like "models/" can't be mistaken for a model id).
   for a in ${models[@]+"${models[@]}"}; do
     case "$a" in
-      /*|./*|../*|~*|.) [[ -z $BASE ]] || die "more than one base dir given ('$BASE' and '$a')"; BASE=$a ;;
-      *)                realmodels+=("$a") ;;
+      /*|./*|../*|~*|.|*/) [[ -z $BASE ]] || die "more than one base dir given ('$BASE' and '$a')"; BASE=${a%/}; [[ -n $BASE ]] || BASE=/ ;;
+      *)                   realmodels+=("$a") ;;
     esac
   done
   if [[ -z $BASE ]]; then BASE=${HFGET_DEST:-${HF_NAS_DIR:-}}; fi
@@ -2136,8 +2234,9 @@ cmd_update() {
     info "${C_DIM}found ${#realmodels[@]} managed model(s) under $BASE${C_OFF}"
   else
     [[ ${#realmodels[@]} -gt 0 ]] || die "usage: hfget update <org/model> [base-dir] [options]   (bulk: hfget update --all [base-dir])"
-    [[ -n $BASE ]] || die "no destination: pass a base dir as an argument, or set HFGET_DEST"
+    [[ -n $BASE ]] || die "no destination: pass a base dir as an argument (absolute, or ending in '/'), or set HFGET_DEST"
   fi
+  dest_safety_nets "$BASE" 1
 
   # Remember the filter the user typed (if any) so each model in an --all run can
   # start clean and, when the user gave none, inherit its own recorded filter.
@@ -2172,7 +2271,6 @@ cmd_update() {
 cmd_outdated() {
   BASE='' TOKEN=''
   local a
-  need_val() { [[ $# -ge 2 ]] || die "option $1 requires a value"; }
   while [[ $# -gt 0 ]]; do
     case "$1" in
       -t|--token) need_val "$@"; TOKEN=$2; shift 2 ;;
@@ -2184,6 +2282,7 @@ cmd_outdated() {
   if [[ -z $BASE ]]; then BASE=${HFGET_DEST:-${HF_NAS_DIR:-}}; fi
   [[ -n $BASE ]] || die "no base dir: pass one as an argument, or set HFGET_DEST"
   [[ -d $BASE ]] || die "not a directory: $BASE"
+  dest_safety_nets "$BASE" 0
 
   resolve_token
   setup_net
@@ -2197,10 +2296,16 @@ cmd_outdated() {
       info "  $(printf '%-38s' "$id") ${C_DIM}(unreadable manifest)${C_OFF}"; unknown=$((unknown + 1)); continue
     fi
     mrev=${MANIFEST_REV:-main}
+    if [[ -z ${MANIFEST_COMMIT:-} ]]; then
+      # No commit was recorded (the model-info call failed when the manifest
+      # was written) — there is nothing to compare, so don't cry "update".
+      info "  $(printf '%-38s' "$id") ${C_DIM}rev=$mrev — no commit recorded; run 'hfget update $id' once${C_OFF}"; unknown=$((unknown + 1))
+      continue
+    fi
     cur=$(current_commit "$id" "$mrev")
     if [[ -z $cur ]]; then
       info "  $(printf '%-38s' "$id") ${C_DIM}rev=$mrev — could not check${C_OFF}"; unknown=$((unknown + 1))
-    elif [[ -n ${MANIFEST_COMMIT:-} && $cur == "$MANIFEST_COMMIT" ]]; then
+    elif [[ $cur == "$MANIFEST_COMMIT" ]]; then
       info "  $(printf '%-38s' "$id") ${C_GRN}up to date${C_OFF}  (rev=$mrev @ ${cur:0:12})"
     else
       upd=$((upd + 1))
@@ -2230,7 +2335,6 @@ cmd_outdated() {
 cmd_scan() {
   MODEL='' REV='main' TOKEN=''
   INCLUDES=() EXCLUDES=()
-  need_val() { [[ $# -ge 2 ]] || die "option $1 requires a value"; }
   while [[ $# -gt 0 ]]; do
     case "$1" in
       -r|--revision) need_val "$@"; REV=$2; shift 2 ;;
@@ -2314,7 +2418,6 @@ cmd_scan() {
 cmd_audit() {
   BASE='' TOKEN=''
   local a offline=0
-  need_val() { [[ $# -ge 2 ]] || die "option $1 requires a value"; }
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --offline)  offline=1; shift ;;
@@ -2327,6 +2430,7 @@ cmd_audit() {
   if [[ -z $BASE ]]; then BASE=${HFGET_DEST:-${HF_NAS_DIR:-}}; fi
   [[ -n $BASE ]] || die "no base dir: pass one as an argument, or set HFGET_DEST"
   [[ -d $BASE ]] || die "not a directory: $BASE"
+  dest_safety_nets "$BASE" 0
   if [[ ${HFGET_SCAN:-on} == off ]]; then offline=1; fi
 
   resolve_token
@@ -2437,6 +2541,14 @@ cmd_audit() {
 # overwrite it (never resume onto stale bytes). Any other mode keeps the normal
 # size-skip + resume. Relies on caller-set globals: DEST DEST_REAL MODEL REV_ENC
 # HDRS VERIFY n_work RESULTS PROGF QUIET MIN_SPEED SPEED_TIME.
+
+# Record a failed file for the run summary and, for the queue's progress
+# reporter, take it out of the in-flight set (it contributed 0 bytes).
+mark_fail() {
+  printf 'FAIL\t0\t%s\n' "$1" >> "$RESULTS"
+  if [[ -n ${PROGF:-} ]]; then printf 'F\t0\t%s\n' "$1" >> "$PROGF"; fi
+}
+
 fetch_one() {
   local idx=$1 size=$2 lfs=$3 path=$4 mode=${5:-0}
   local out="$DEST/$path" part url have got rc code stall pre fstart start_have sum outdir
@@ -2449,7 +2561,7 @@ fetch_one() {
   outdir=$(cd "$(dirname "$out")" 2>/dev/null && pwd -P) || outdir=''
   if [[ -z $outdir || ( $outdir != "$DEST_REAL" && $outdir != "$DEST_REAL"/* ) || -L $out || -L $part ]]; then
     warn "[$idx/$n_work] FAILED: $path (destination resolves outside $DEST or is a symlink — refusing to write)"
-    printf 'FAIL\t0\t%s\n' "$path" >> "$RESULTS"
+    mark_fail "$path"
     return 1
   fi
 
@@ -2504,17 +2616,17 @@ fetch_one() {
     # can't keep us here forever.
     if [[ $(( $(date +%s) - fstart )) -gt 43200 ]]; then
       warn "[$idx/$n_work] FAILED: $path (still incomplete after 12h — a stalling server?; have $(human "$got") of $(human "$size"))"
-      printf 'FAIL\t0\t%s\n' "$path" >> "$RESULTS"
+      mark_fail "$path"
       return 1
     fi
     case "$code" in
       401 | 403)
         warn "[$idx/$n_work] FAILED: $path (HTTP $code — gated/private model; accept the license at $HF/$MODEL and pass a token via -t / \$HF_TOKEN)"
-        printf 'FAIL\t0\t%s\n' "$path" >> "$RESULTS"
+        mark_fail "$path"
         return 1 ;;
       404)
         warn "[$idx/$n_work] FAILED: $path (HTTP 404 — the file vanished from the repo?)"
-        printf 'FAIL\t0\t%s\n' "$path" >> "$RESULTS"
+        mark_fail "$path"
         return 1 ;;
     esac
     # Self-healing: an abort that still moved bytes forward (curl exit 28 from
@@ -2531,7 +2643,7 @@ fetch_one() {
       stall=$((stall + 1))
       if [[ $stall -ge 3 ]]; then
         warn "[$idx/$n_work] FAILED: $path (curl exit $rc, HTTP $code; no meaningful progress after 3 attempts; have $(human "$got") of $(human "$size"))"
-        printf 'FAIL\t0\t%s\n' "$path" >> "$RESULTS"
+        mark_fail "$path"
         return 1
       fi
       sleep 2
@@ -2545,18 +2657,18 @@ fetch_one() {
     elif [[ $sum != "$lfs" ]]; then
       rm -f "$part"
       warn "[$idx/$n_work] sha256 MISMATCH: $path — partial removed; rerun to re-download"
-      printf 'FAIL\t0\t%s\n' "$path" >> "$RESULTS"
+      mark_fail "$path"
       return 1
     fi
   fi
 
   if ! mv -f "$part" "$out"; then
     warn "[$idx/$n_work] FAILED: $path (could not move into place at $DEST — check permissions/space)"
-    printf 'FAIL\t0\t%s\n' "$path" >> "$RESULTS"
+    mark_fail "$path"
     return 1
   fi
   printf 'OK\t%s\t%s\n' "$((size - start_have))" "$path" >> "$RESULTS"
-  if [[ -n ${PROGF:-} ]]; then printf 'F\t%s\n' "$((size - start_have))" >> "$PROGF"; fi
+  if [[ -n ${PROGF:-} ]]; then printf 'F\t%s\t%s\n' "$((size - start_have))" "$path" >> "$PROGF"; fi
   if [[ $QUIET -eq 1 ]]; then
     info "[$idx/$n_work] ${C_GRN}done${C_OFF} $path ($(human "$size"))"
   elif [[ $VERIFY -eq 1 && $lfs != "-" ]]; then
