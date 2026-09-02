@@ -368,9 +368,10 @@ teardown() {
 }
 
 @test "foreign_hfget_pids can be narrowed to one model id" {
-  # Fake another 'hfget download' of a model: argv[0] is what ps shows.
-  bash -c 'exec -a "bash /somewhere/hfget download org/model-a /dest" sleep 20' &
-  fake=$!
+  # Fake another 'hfget download' of a model: argv[0] is what ps shows. It is
+  # spawned detached (via a throwaway shell that exits at once) so its parent
+  # is not this test process — a direct child would be skipped as "our own".
+  fake=$(bash -c 'exec -a "bash /somewhere/hfget download org/model-a /dest" sleep 20 >/dev/null 2>&1 & echo $!')
   sleep 0.3
   all=$(foreign_hfget_pids)
   [[ " $all " == *" $fake "* ]]

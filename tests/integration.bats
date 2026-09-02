@@ -151,11 +151,11 @@ teardown() {
 }
 
 @test "download refuses to be a second writer on a model another hfget is fetching" {
-  bash -c "exec -a 'bash /elsewhere/hfget download $TINY /some/dest' sleep 30" &
-  fake=$!
+  # a detached fake (see the unit test): its parent must not be this process
+  fake=$(bash -c "exec -a 'bash /elsewhere/hfget download $TINY /some/dest' sleep 30 >/dev/null 2>&1 & echo \$!")
   sleep 0.3
   run "$HFGET" download "$TINY" "$DEST" -y
-  kill "$fake" 2>/dev/null || true; wait "$fake" 2>/dev/null || true
+  kill "$fake" 2>/dev/null || true
   [ "$status" -ne 0 ]
   [[ "$output" == *"another hfget is already downloading"* ]]
   [ ! -d "$DEST/$TINY" ]
